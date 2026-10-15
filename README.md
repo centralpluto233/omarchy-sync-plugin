@@ -89,6 +89,7 @@ A plugin folder with a `.git` checkout is never copied in either direction, so A
 
 - **Install** when a listed plugin is missing. It opens Omarchy's own plugin installer (`omarchy plugin add <source>`) in a floating terminal, so you see Omarchy's warning and confirm there.
 - **Update** when the repo lists a newer version or a commit this checkout has not seen. It opens `omarchy plugin update <id>`, which pulls the plugin's upstream, not the repo.
+- Incoming listed plugins can also be handled together with **Apply**; their install, update, or plain-copy reinstall commands run in one visible floating terminal.
 - An outgoing row when this machine is ahead, or when you uninstalled a listed plugin (unticked by default).
 
 Repos that already hold copied files for a git plugin under `plugins/<id>/` stop applying them. Publishing that plugin's list entry removes the copy from the repo. Plugins without `.git` (your own, or a clone of a built-in) keep syncing file by file.

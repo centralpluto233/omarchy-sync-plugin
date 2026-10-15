@@ -636,12 +636,23 @@ Panel {
     return out
   }
 
-  // Only outgoing rows are picks; installs and updates go through Omarchy.
+  // Outgoing plugin-list rows are picks; incoming list rows are applied through
+  // Omarchy's own installer/update flow when Apply is confirmed.
   function selectedPublishListPlugins() {
     var out = []
     for (var i = 0; i < outgoingItems.length; i++) {
       var row = outgoingItems[i]
       if (row.kind === "l" && row.pickable !== false && isPicked("l", row.itemId)) out.push(row.itemId)
+    }
+    return out
+  }
+
+  function selectedApplyListPlugins() {
+    var out = []
+    for (var i = 0; i < incomingItems.length; i++) {
+      var row = incomingItems[i]
+      if (row.kind === "l" && row.action !== "" && row.itemId !== "" && row.pickable === false)
+        out.push(row.itemId)
     }
     return out
   }
@@ -668,7 +679,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedMergeFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length + selectedPackageCount("apply") === 0 && !selectedApplyTheme()) {
+    if (selectedApplyFiles().length + selectedMergeFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedApplyListPlugins().length + selectedBundleFiles("apply").length + selectedPackageCount("apply") === 0 && !selectedApplyTheme()) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -704,10 +715,12 @@ Panel {
       if (includeMachine) args.push("--include-machine")
       var ashort = selectedApplyShortcuts()
       var aplugs = selectedApplyPlugins()
+      var alist = selectedApplyListPlugins()
       var apackages = selectedPackageIds("apply")
       var ai
       for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
       for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
+      for (ai = 0; ai < alist.length; ai++) args.push("--list-plugin", alist[ai])
       for (ai = 0; ai < apackages.length; ai++) args.push("--package", apackages[ai])
       var amerge = selectedMergeFiles()
       for (ai = 0; ai < amerge.length; ai++) args.push("--merge", amerge[ai])
