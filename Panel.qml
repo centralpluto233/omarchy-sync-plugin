@@ -45,6 +45,9 @@ Panel {
   property var pluginDiffs: []
   property var bundleDiffs: []
   property var pluginListDiffs: []
+  property var packageDiffs: []
+  property string packageMode: "all"
+  property var packagePicks: ({})
   property var themeDiff: null
   property bool openOnChanges: false
   property bool showingHidden: false
@@ -147,27 +150,54 @@ Panel {
     if (String(themeDiff.status) === "both") return [themeDiff]
     return []
   }
+  readonly property var packageRows: {
+    var out = []
+    for (var i = 0; i < packageDiffs.length; i++) {
+      var group = packageDiffs[i]
+      var rows = group.items || []
+      for (var j = 0; j < rows.length; j++) {
+        var row = Object.assign({}, rows[j])
+        row.groupLabel = group.label
+        row.summary = row.status === "repo" ? "Incoming · install on this machine" : "Outgoing · add to the repo"
+        row.kind = "package"
+        out.push(row)
+      }
+    }
+    return out
+  }
+  readonly property var incomingPackageRows: {
+    var out = []
+    for (var i = 0; i < packageRows.length; i++)
+      if (packageRows[i].status === "repo") out.push(packageRows[i])
+    return out
+  }
+  readonly property var outgoingPackageRows: {
+    var out = []
+    for (var i = 0; i < packageRows.length; i++)
+      if (packageRows[i].status === "local") out.push(packageRows[i])
+    return out
+  }
   readonly property var incomingItems: Model.buildIncomingItems(incomingTheme, incomingAddedShortcuts, incomingChangedShortcuts, incomingBundles, incomingFiles.concat(differsFiles), diffFiles, hiddenMap, incomingPluginList)
   readonly property var outgoingItems: Model.buildOutgoingItems(outgoingTheme, localAddedShortcuts, localChangedShortcuts, localBundles, localFiles, diffFiles, hiddenMap, outgoingPluginList)
   readonly property var bothItems: Model.buildBothItems(bothTheme, bothShortcuts, bothBundles, bothFiles, diffFiles, hiddenMap)
   readonly property var hiddenItems: Model.buildHiddenItems((themeDiff ? [themeDiff] : []), shortcutDiffs, bundleDiffs, diffFiles, diffFiles, hiddenMap, pluginListDiffs)
-  readonly property int incomingCount: incomingItems.length
-  readonly property int outgoingCount: outgoingItems.length
+  readonly property int incomingCount: incomingItems.length + incomingPackageRows.length
+  readonly property int outgoingCount: outgoingItems.length + outgoingPackageRows.length
   readonly property int bothCount: bothItems.length
   readonly property int hiddenCount: hiddenItems.length
   readonly property int incomingPicked: {
     var _ = picks
-    return Model.pickedInItems(incomingItems, picks)
+    return Model.pickedInItems(incomingItems, picks) + selectedPackageCount("apply")
   }
   readonly property int outgoingPicked: {
     var _ = picks
-    return Model.pickedInItems(outgoingItems, picks)
+    return Model.pickedInItems(outgoingItems, picks) + selectedPackageCount("publish")
   }
   readonly property int bothPicked: {
     var _ = picks
     return Model.pickedInItems(bothItems, picks)
   }
-  readonly property bool hasReviewable: incomingCount + outgoingCount + bothCount + conflictFiles.length > 0
+  readonly property bool hasReviewable: incomingCount + outgoingCount + bothCount + packageRows.length + conflictFiles.length > 0
   readonly property int unresolvedBoth: {
     var n = 0
     var i
@@ -245,6 +275,51 @@ Panel {
     var next = cloneMap(picks)
     next[pickId(kind, id)] = on
     picks = next
+  }
+
+  function setPackageMode(mode) {
+    packageMode = mode
+    var next = {}
+    packagePicks = next
+  }
+
+  function togglePackageGroup(groupId) {
+    var next = cloneMap(packagePicks)
+    var key = "group:" + groupId
+    next[key] = !next[key]
+    packagePicks = next
+  }
+
+  function togglePackageRow(id) {
+    var next = cloneMap(packagePicks)
+    var key = "package:" + id
+    next[key] = !next[key]
+    packagePicks = next
+  }
+
+  function packageGroupPicked(groupId) {
+    return !!packagePicks["group:" + groupId]
+  }
+
+  function packageRowPicked(id) {
+    return !!packagePicks["package:" + id]
+  }
+
+  function selectedPackageIds(direction) {
+    var rows = packageRows
+    var out = []
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      var selected = packageMode === "all"
+        || (packageMode === "groups" && packageGroupPicked(row.group))
+        || (packageMode === "packages" && packageRowPicked(row.id))
+      if (selected) out.push(row.id)
+    }
+    return out
+  }
+
+  function selectedPackageCount(direction) {
+    return selectedPackageIds(direction).length
   }
 
   function seedPicks() {
@@ -582,7 +657,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedMergeFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme()) {
+    if (selectedApplyFiles().length + selectedMergeFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length + selectedPackageCount("apply") === 0 && !selectedApplyTheme()) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -601,7 +676,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedPublishFiles().length + selectedMergeFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedPublishListPlugins().length + selectedBundleFiles("publish").length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
+    if (selectedPublishFiles().length + selectedMergeFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedPublishListPlugins().length + selectedBundleFiles("publish").length + selectedPackageCount("publish") === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
       lastError = "Check the local shortcuts, plugins, or files you want to publish."
       activeTab = 1
       return
@@ -618,9 +693,11 @@ Panel {
       if (includeMachine) args.push("--include-machine")
       var ashort = selectedApplyShortcuts()
       var aplugs = selectedApplyPlugins()
+      var apackages = selectedPackageIds("apply")
       var ai
       for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
       for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
+      for (ai = 0; ai < apackages.length; ai++) args.push("--package", apackages[ai])
       var amerge = selectedMergeFiles()
       for (ai = 0; ai < amerge.length; ai++) args.push("--merge", amerge[ai])
       if (selectedApplyTheme()) args.push("--theme")
@@ -631,9 +708,11 @@ Panel {
       if (includeMachine) pargs.push("--include-machine")
       var pshort = selectedPublishShortcuts()
       var pplugs = selectedPublishPlugins()
+      var ppackages = selectedPackageIds("publish")
       var pi
       for (pi = 0; pi < pshort.length; pi++) pargs.push("--shortcut", pshort[pi])
       for (pi = 0; pi < pplugs.length; pi++) pargs.push("--plugin", pplugs[pi])
+      for (pi = 0; pi < ppackages.length; pi++) pargs.push("--package", ppackages[pi])
       var pmerge = selectedMergeFiles()
       for (pi = 0; pi < pmerge.length; pi++) pargs.push("--merge", pmerge[pi])
       var plist = selectedPublishListPlugins()
@@ -733,6 +812,7 @@ Panel {
     pluginDiffs = (data.diff && data.diff.plugins) ? data.diff.plugins : []
     bundleDiffs = (data.diff && data.diff.bundles) ? data.diff.bundles : []
     pluginListDiffs = (data.diff && data.diff.plugin_list) ? data.diff.plugin_list : []
+    packageDiffs = (data.diff && data.diff.packages) ? data.diff.packages : []
     themeDiff = (data.diff && data.diff.theme) ? data.diff.theme : null
     if (data.sync_state && status)
       status = Object.assign({}, status, { sync_state: data.sync_state })
@@ -1685,6 +1765,10 @@ Panel {
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
         wrapMode: Text.WordWrap
+      }
+
+      PackageSyncSection {
+        visible: !root.showingHidden && root.packageRows.length > 0
       }
 
       Row {
@@ -2869,6 +2953,174 @@ Panel {
             repoPath: modelData.repo_path || ""
             summary: modelData.summary
             statusLabel: Model.fileStatusLabel(modelData.status, modelData.removal) + (modelData.portable ? "" : " · Machine-specific")
+          }
+        }
+      }
+    }
+  }
+
+  component PackageSyncSection: CardBox {
+    width: parent ? parent.width : 100
+    Column {
+      width: parent.width
+      spacing: Style.space(8)
+
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Packages"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        font.bold: true
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "The repo and this machine differ in " + root.packageRows.length + " packages. Choose everything, a package group, or individual packages."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Row {
+        spacing: Style.space(6)
+        Button {
+          text: "Everything"
+          selected: root.packageMode === "all"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.setPackageMode("all")
+        }
+        Button {
+          text: "By group"
+          selected: root.packageMode === "groups"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.setPackageMode("groups")
+        }
+        Button {
+          text: "Per package"
+          selected: root.packageMode === "packages"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.setPackageMode("packages")
+        }
+      }
+      Text {
+        visible: root.packageMode === "all"
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Apply/Publish will sync every package difference below. Packages removed from the other side are removed too."
+        color: root.accent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Column {
+        visible: root.packageMode === "groups"
+        width: parent.width
+        spacing: Style.space(6)
+        Repeater {
+          model: root.packageDiffs
+          Rectangle {
+            required property var modelData
+            width: parent.width
+            height: packageGroupText.implicitHeight + Style.space(18)
+            radius: Style.cornerRadius
+            color: root.packageGroupPicked(modelData.id)
+              ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+              : root.cardBg
+            border.width: 1
+            border.color: root.packageGroupPicked(modelData.id) ? root.accent : root.cardBorder
+            Row {
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              spacing: Style.space(8)
+              Text {
+                id: packageGroupText
+                width: parent.width - packageGroupButton.width - parent.spacing
+                textFormat: Text.PlainText
+                text: modelData.label + "  ·  " + modelData.changed_count + " changes (" + modelData.incoming_count + " incoming, " + modelData.outgoing_count + " outgoing)"
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+                anchors.verticalCenter: parent.verticalCenter
+              }
+              Button {
+                id: packageGroupButton
+                text: root.packageGroupPicked(modelData.id) ? "Included" : "Select"
+                selected: root.packageGroupPicked(modelData.id)
+                bordered: true
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                fontSize: Style.font.caption
+                anchors.verticalCenter: parent.verticalCenter
+                onClicked: root.togglePackageGroup(modelData.id)
+              }
+            }
+          }
+        }
+      }
+      Column {
+        visible: root.packageMode === "packages"
+        width: parent.width
+        spacing: Style.space(4)
+        Repeater {
+          model: root.packageRows
+          Rectangle {
+            required property var modelData
+            width: parent.width
+            height: packageRowText.implicitHeight + Style.space(16)
+            radius: Style.cornerRadius
+            color: root.packageRowPicked(modelData.id)
+              ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.12)
+              : root.cardBg
+            border.width: 1
+            border.color: root.packageRowPicked(modelData.id) ? root.accent : root.cardBorder
+            Row {
+              anchors.fill: parent
+              anchors.margins: Style.space(8)
+              spacing: Style.space(8)
+              Rectangle {
+                width: 22
+                height: 22
+                radius: 4
+                color: root.packageRowPicked(modelData.id) ? root.accent : Color.background
+                border.width: 1
+                border.color: root.foreground
+                anchors.verticalCenter: parent.verticalCenter
+                Text {
+                  anchors.centerIn: parent
+                  text: root.packageRowPicked(modelData.id) ? "✓" : ""
+                  color: Color.background
+                  font.pixelSize: 15
+                }
+              }
+              Text {
+                id: packageRowText
+                width: parent.width - 22 - parent.spacing
+                textFormat: Text.PlainText
+                text: modelData.label + "  ·  " + modelData.name + "  ·  " + modelData.summary
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+                anchors.verticalCenter: parent.verticalCenter
+              }
+            }
+            MouseArea {
+              anchors.fill: parent
+              cursorShape: Qt.PointingHandCursor
+              onClicked: root.togglePackageRow(modelData.id)
+            }
           }
         }
       }
