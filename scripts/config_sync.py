@@ -1996,6 +1996,25 @@ def package_file_sets(ctx: Context, repo: Path) -> dict[str, set[str]]:
     }
 
 
+def package_inventory_summary(ctx: Context, repo: Path) -> list[dict[str, Any]]:
+    summary = []
+    for group_id, label, rel, manager in PACKAGE_SPECS:
+        local, local_error = local_package_names(ctx, manager)
+        repo_file = repo / rel
+        tracked = package_names_from_text(read_text(repo_file, within=repo)) if repo_file.is_file() else set()
+        summary.append(
+            {
+                "id": group_id,
+                "label": label,
+                "installed": len(local),
+                "tracked": len(tracked),
+                "available": bool(shutil.which(manager if manager != "aur" else "pacman")),
+                "error": local_error or "",
+            }
+        )
+    return summary
+
+
 def publish_package_rows(ctx: Context, repo: Path, rows: list[dict[str, Any]]) -> list[str]:
     if not rows:
         return []
@@ -3880,6 +3899,8 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
         if present:
             terminals.append(Path(rel).stem.replace("ghostty.config", "ghostty"))
 
+    package_stats = package_inventory_summary(ctx, repo)
+
     configs = []
     for item in collect_inventory(ctx, repo):
         wanted = item["local_exists"] if prefer_local else item["repo_exists"]
@@ -3907,6 +3928,7 @@ def inspect_repo(ctx: Context, repo: Path, prefer_local: bool = False) -> dict[s
         "bins": bins,
         "terminals": terminals,
         "configs": configs,
+        "packages": package_stats,
         "theme": inspect_theme(ctx, repo, prefer_local=prefer_local),
     }
 
