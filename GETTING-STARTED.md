@@ -127,6 +127,7 @@ On the new Omarchy machine:
 2. Click the icon, paste the **same** private repo URL, Connect.
 3. This time the repo is **not** empty. Review incoming shortcuts and plugins.
 4. Click **Apply** (not Publish). A timestamped backup is written under `~/.config/omarchy-backup.*` first.
+   Incoming listed plugins are installed or updated through Omarchy in a visible floating terminal.
 
 After that, daily life is:
 

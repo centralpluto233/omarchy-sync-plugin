@@ -1989,6 +1989,38 @@ def package_operation_command(rows: list[dict[str, Any]], direction: str) -> str
     return " ; ".join(commands)
 
 
+def plugin_list_operation_command(ctx: Context, repo: Path, ids: list[str]) -> str:
+    commands = ["set -euo pipefail", "printf '\\nPlugin sync started (%s)\\n' \"$(date)\""]
+    entries = repo_plugin_list(repo)
+    for pid in ids:
+        entry = entries.get(pid)
+        if not entry or not entry.get("source"):
+            continue
+        action = next(
+            (
+                row.get("action")
+                for row in (plugin_list_diff(ctx, repo, load_state(ctx)) or [])
+                if row.get("id") == pid
+            ),
+            "install",
+        )
+        if action == "update":
+            commands.append("omarchy-plugin-update " + shlex.quote(pid))
+        elif action == "reinstall":
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup = ctx.home / ".config" / f"omarchy-backup.{stamp}" / "plugins" / pid
+            commands.append(reinstall_plugin_command(ctx.config_plugins / pid, backup, entry["source"]))
+        else:
+            commands.append("omarchy-plugin-add " + shlex.quote(entry["source"]))
+    commands.extend(
+        [
+            "printf '\\nPlugin sync finished successfully. Refresh Config Sync to verify the result.\\n'",
+            "read -r -p 'Press Enter to close…' _",
+        ]
+    )
+    return " ; ".join(commands)
+
+
 def package_file_sets(ctx: Context, repo: Path) -> dict[str, set[str]]:
     return {
         group_id: package_names_from_text(read_text(repo / rel, within=repo)) if (repo / rel).is_file() else set()
@@ -4862,6 +4894,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
+    list_plugin_ids = [p for p in (getattr(args, "list_plugin", None) or []) if p]
     package_rows = selected_package_rows(diff.get("packages") or [], getattr(args, "package", None))
     wanted = parse_files_arg(args.files, explicit=explicit)
     if plugin_ids:
@@ -4913,7 +4946,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-repo", "repo", "differs"},
         "repo_portable",
     )
-    if not chosen and not shortcut_keys and not merges and not package_rows:
+    if not chosen and not shortcut_keys and not merges and not package_rows and not list_plugin_ids:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
@@ -4937,6 +4970,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         snap["applied"] = applied
         snap["removed"] = removed
         snap["packages"] = [row["id"] for row in package_rows]
+        snap["plugins"] = list_plugin_ids
         snap["skipped_shortcuts"] = skipped_shortcuts
         snap["dry_run"] = True
         snap["message"] = (
@@ -5040,6 +5074,15 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 f"{PLUGIN_TERMINAL_LAUNCHER} or run the package commands manually."
             )
         package_started = True
+    plugin_started = False
+    if list_plugin_ids:
+        command = plugin_list_operation_command(ctx, repo, list_plugin_ids)
+        if not launch_omarchy_terminal(command):
+            raise SyncError(
+                "Could not open the plugin sync terminal. Install "
+                f"{PLUGIN_TERMINAL_LAUNCHER} or install the plugins manually."
+            )
+        plugin_started = True
     snap = build_snapshot(ctx, fetch=False)
     snap["applied"] = applied
     snap["backup_dir"] = str(backup_dir)
@@ -5053,12 +5096,14 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         f"Applied {len(applied)} file{'s' if len(applied) != 1 else ''} from the repo"
         + (f" ({len(removed)} removed from this machine)" if removed else "")
         + (f" Started package sync for {len(package_rows)} package{'s' if len(package_rows) != 1 else ''} in a floating terminal." if package_started else "")
+        + (f" Started plugin sync for {len(list_plugin_ids)} plugin{'s' if len(list_plugin_ids) != 1 else ''} in a floating terminal." if plugin_started else "")
         + f".{theme_msg}"
         + skipped_shortcut_note(skipped_shortcuts)
     )
     snap["skipped_shortcuts"] = skipped_shortcuts
     snap["removed"] = removed
     snap["packages"] = [row["id"] for row in package_rows]
+    snap["plugins"] = list_plugin_ids
     return snap
 
 
@@ -5382,7 +5427,11 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     list_plugins = [
         row["id"]
         for row in (diff.get("plugin_list") or [])
-        if side == "local" and not row.get("hidden") and row.get("status") in {"local", "added-local"}
+        if not row.get("hidden")
+        and (
+            (side == "local" and row.get("status") in {"local", "added-local"})
+            or (side == "repo" and row.get("status") in {"repo", "added-repo"})
+        )
     ]
 
     nested = argparse.Namespace(
@@ -5391,6 +5440,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         shortcut=shortcuts,
         plugin=plugins,
         list_plugin=list_plugins,
+        package=[row["id"] for group in (diff.get("packages") or []) for row in group.get("items", [])],
         theme=theme,
         fetch=False,
         push=side == "local" or bool(getattr(args, "push", False)),
@@ -5405,7 +5455,7 @@ def cmd_resync(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     )
 
     if side == "repo":
-        if not files and not shortcuts and not plugins and not theme:
+        if not files and not shortcuts and not plugins and not list_plugins and not theme:
             snap = build_snapshot(ctx, fetch=False)
             snap["message"] = "Nothing from the repo to apply. This machine may already match."
             return snap
