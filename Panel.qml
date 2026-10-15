@@ -165,6 +165,17 @@ Panel {
     }
     return out
   }
+  readonly property var packageStats: (root.inspect && root.inspect.packages) ? root.inspect.packages : []
+  readonly property int installedPackageCount: {
+    var total = 0
+    for (var i = 0; i < packageStats.length; i++) total += Number(packageStats[i].installed || 0)
+    return total
+  }
+  readonly property int trackedPackageCount: {
+    var total = 0
+    for (var i = 0; i < packageStats.length; i++) total += Number(packageStats[i].tracked || 0)
+    return total
+  }
   readonly property var incomingPackageRows: {
     var out = []
     for (var i = 0; i < packageRows.length; i++)
@@ -1426,7 +1437,7 @@ Panel {
       Row {
         width: parent.width
         spacing: Style.space(8)
-        readonly property real pillW: (width - spacing * 3) / 4
+        readonly property real pillW: (width - spacing * 4) / 5
 
         QuickPill {
           width: parent.pillW
@@ -1439,6 +1450,14 @@ Panel {
           icon: "󰐱"
           label: "Plugins"
           value: root.inspect && root.inspect.plugins ? String(root.inspect.plugins.length) : "—"
+          highlightColor: root.inspect && root.inspect.plugins && root.inspect.plugins.length > 0 ? root.accent : root.foreground
+        }
+        QuickPill {
+          width: parent.pillW
+          icon: "󰏖"
+          label: "Installed"
+          value: root.packageStats.length > 0 ? String(root.installedPackageCount) : "—"
+          highlightColor: root.installedPackageCount > 0 ? root.accent : root.foreground
         }
         QuickPill {
           width: parent.pillW
@@ -2194,7 +2213,16 @@ Panel {
     Column {
       width: parent.width
       spacing: Style.space(6)
-      PanelSectionHeader { text: "INSTALLED PLUGINS (" + (root.inspect && root.inspect.plugins ? root.inspect.plugins.length : 0) + ")"; foreground: root.foreground; fontFamily: root.fontFamily }
+      PanelSectionHeader { text: "INSTALLED PLUGINS · " + (root.inspect && root.inspect.plugins ? root.inspect.plugins.length : 0); foreground: root.foreground; fontFamily: root.fontFamily }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Plugins are shown with their version, install type, and availability on this machine."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
       Text {
         textFormat: Text.PlainText
         visible: !root.inspect || !root.inspect.plugins || root.inspect.plugins.length === 0
@@ -2221,7 +2249,7 @@ Panel {
                 font.pixelSize: Style.font.body
                 font.bold: true
                 elide: Text.ElideRight
-                width: parent.width - ver.implicitWidth - Style.space(74)
+                width: parent.width - ver.implicitWidth - Style.space(160)
               }
               Text {
                 id: ver
@@ -2231,6 +2259,45 @@ Panel {
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
                 anchors.verticalCenter: parent.verticalCenter
+              }
+              Rectangle {
+                visible: !!modelData.installed
+                implicitWidth: installedBadge.implicitWidth + Style.space(10)
+                implicitHeight: installedBadge.implicitHeight + Style.space(4)
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                color: Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.16)
+                border.width: 1
+                border.color: root.accent
+                anchors.verticalCenter: parent.verticalCenter
+                Text {
+                  id: installedBadge
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "Installed"
+                  color: root.accent
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption - 2
+                  font.bold: true
+                }
+              }
+              Rectangle {
+                visible: !!modelData.git
+                implicitWidth: gitBadge.implicitWidth + Style.space(10)
+                implicitHeight: gitBadge.implicitHeight + Style.space(4)
+                radius: Style.cornerRadius > 0 ? Style.space(4) : 2
+                color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.06)
+                border.width: 1
+                border.color: root.cardBorder
+                anchors.verticalCenter: parent.verticalCenter
+                Text {
+                  id: gitBadge
+                  anchors.centerIn: parent
+                  textFormat: Text.PlainText
+                  text: "Git"
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption - 2
+                }
               }
               Row {
                 spacing: Style.space(4)
@@ -2365,6 +2432,96 @@ Panel {
   }
 
   Component {
+    id: packagesExtraComp
+    Column {
+      width: parent.width
+      spacing: Style.space(8)
+      PanelSectionHeader {
+        text: "PACKAGE INVENTORY · " + root.installedPackageCount + " INSTALLED"
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+      }
+      Text {
+        width: parent.width
+        textFormat: Text.PlainText
+        text: "Native pacman, AUR, and Flatpak are counted separately so it is clear what will be restored."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+      }
+      Repeater {
+        model: root.packageStats
+        Rectangle {
+          required property var modelData
+          width: parent.width
+          implicitHeight: packageStatCol.implicitHeight + Style.space(16)
+          radius: Style.cornerRadius
+          color: root.cardBg
+          border.width: 1
+          border.color: root.cardBorder
+          Row {
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            anchors.leftMargin: Style.space(10)
+            anchors.rightMargin: Style.space(10)
+            spacing: Style.space(10)
+            Column {
+              id: packageStatCol
+              width: parent.width - packageStatCount.width - parent.spacing
+              spacing: 2
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: modelData.label
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                font.bold: true
+              }
+              Text {
+                width: parent.width
+                textFormat: Text.PlainText
+                text: modelData.tracked > 0
+                  ? modelData.tracked + " tracked in repo"
+                  : "Not tracked yet"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+            Column {
+              id: packageStatCount
+              spacing: 0
+              anchors.verticalCenter: parent.verticalCenter
+              Text {
+                textFormat: Text.PlainText
+                text: String(modelData.installed)
+                color: root.accent
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+                horizontalAlignment: Text.AlignRight
+                anchors.right: parent.right
+              }
+              Text {
+                textFormat: Text.PlainText
+                text: "installed"
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption - 2
+                horizontalAlignment: Text.AlignRight
+                anchors.right: parent.right
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  Component {
     id: hooksExtraComp
     Column {
       width: parent.width
@@ -2460,11 +2617,22 @@ Panel {
         categoryId: "plugins"
         iconText: "󰐱"
         title: "Plugins & Bar"
-        subtitle: "Shell plugins, widgets & bar layout (plugins/)"
+        subtitle: (root.inspect && root.inspect.plugins ? root.inspect.plugins.length : 0) + " installed · shell plugins, widgets & bar layout"
         changeItems: Model.itemsForCategory(root.allReviewItems, "plugins")
         files: Model.filesForCategory(root.diffFiles, "plugins")
         inspectItems: root.inspect ? root.inspect.plugins : []
         extraContent: pluginsExtraComp
+      }
+
+      CategorySection {
+        categoryId: "packages"
+        iconText: "󰏖"
+        title: "Packages"
+        subtitle: root.installedPackageCount + " installed · " + root.trackedPackageCount + " tracked in repo"
+        changeItems: []
+        files: []
+        inspectItems: root.packageStats
+        extraContent: packagesExtraComp
       }
 
       CategorySection {
