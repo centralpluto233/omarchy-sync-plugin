@@ -27,7 +27,8 @@ When there is drift, **Review Changes** opens a checklist: incoming vs local **s
 - **Apply** copies repo → this machine (timestamped backup under `~/.config/omarchy-backup.<timestamp>/`), reloads Hyprland, and rescans the shell. The Config Sync widget itself is preserved in the bar even if the incoming `shell.json` does not list it.
 - **Publish** copies this machine → repo, commits, and pushes so the next machine can Apply.
 - **Drift detection** on open (and every 10 minutes): local-only edits, incoming remote files, both-changed files, and git merge conflicts.
-- **Conflict handling**: per-file Keep local / Take repo for overlapping edits; Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
+- **Three-way merge**: when both machines edited the same config file, Config Sync compares each side with the version they last synced. A file that already contains the other side's edits is a plain one-way change. Otherwise the row offers **Merge**, which keeps both sides' edits: line by line for text files, key by key for `shell.json`. Where both changed the same lines or key, Merge keeps this machine's and the row says which. Merge is picked for you only when nothing overlaps. Apply writes the merge here, Publish writes it to the repo, and the other button finishes the job.
+- **Conflict handling**: per-file Keep local / Take repo when a merge is not possible (the selected theme, plugins, or no common version in the repo's history); Keep local / Take incoming for git merge conflicts. Display layout (`hypr/monitors.lua`) stays on this machine unless you opt in.
 
 ## Install
 
@@ -94,6 +95,10 @@ Machine-local files are **not** applied unless you enable **Include machine-loca
 - Extra paths listed in `.omarchy-config.json` under `machine_local`
 
 Per-machine Hyprland overlays (`*.local.lua`, `local.conf`, `input.local.lua`, …) are ignored entirely so they never show up as Incoming. Plugin files such as `Local.qml` are still synced. Night-light (`hypr/hyprsunset.conf`) stays portable.
+
+Shortcuts merge three ways. Config Sync remembers the shortcuts both sides last agreed on, so a bind you delete here shows up as **Removed here** (outgoing), not as "new in repo" waiting to come back. A bind another machine deleted shows up as **Removed in repo**. Deletes are never ticked for you. Publishing or applying one removes the `hl.unbind` / `o.bind` pair for that key. A bind whose body spans several lines is never removed line by line.
+
+Keycode copies such as `SUPER + code:54` next to `SUPER + C` (Omarchy's default or your own) fire together on one press. Omarchy resolves binds against the first, Latin layout, so the copy runs a second time on every layout. Those rows say which bind they duplicate and stay unticked. So does an incoming `hl.unbind` that only works on the other machine because a keycode copy took over the key there.
 
 Shortcut cherry-pick copies one `o.bind` / `o.rebind` / `hl.unbind` line at a time. A command that is a string, a number, `os.getenv(...)`, or `hl.dsp.*` is portable. If the command only works because of a `local` defined elsewhere in `bindings.lua` (a helper function, an undefined name, …), that shortcut is listed with a skip reason and is **not** copied — applying it would abort Hyprland's `require("hypr.bindings")` on the other machine. Path locals such as `local snap = os.getenv("HOME") .. "/.local/bin/hypr-quarter-snap"` are inlined into a self-contained command when publishing. Helper scripts those bindings, hooks, or plugins reference are offered under **Helper scripts** (the rest of `~/.local/bin` is left alone). Apply restores the execute bit on plugin shebang scripts and ELF binaries (`radio-fetch`, `scripts/audio-*`, …) so Qt/QML `Process` can start them. Theme scripts still land non-executable.
 

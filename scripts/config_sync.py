@@ -83,7 +83,7 @@ SKIP_DIR_NAMES = {".git", "__pycache__", ".mypy_cache", ".pytest_cache", "node_m
 SKIP_FILE_NAMES = {".DS_Store"}
 SKIP_NAME_RE = re.compile(r"\.bak(\.|$)")
 PROTECTED_PLUGINS = {PLUGIN_ID}  # this plugin is excluded from sync so it does not self-report or overwrite itself
-PLUGIN_VERSION = "1.4.1"
+PLUGIN_VERSION = "1.5.0"
 
 FILE_SUMMARIES = {
     "hypr/autostart.lua": "Autostart programs",
@@ -107,6 +107,7 @@ MACHINE_LOCAL_PATHS = set(DEFAULT_MACHINE_LOCAL_PATHS)
 LOCAL_OVERLAY_EXACT = frozenset({"local.conf", "local.lua", "local.toml"})
 LOCAL_OVERLAY_SUFFIXES = frozenset({"lua", "conf", "toml", "config"})
 THEME_REL = "omarchy/theme.name"
+SHELL_REL = "omarchy/shell.json"
 THEME_SKIP_SUFFIXES = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".heic",
     # Video wallpapers are often tens of MB. Keep them out of the repo like images.
@@ -135,6 +136,9 @@ class Context:
     state_dir: Path
     default_clone: Path
     plugin_root: Path | None = None
+    # Omarchy's install tree. Its default bindings tell which keys are already
+    # taken before hypr/bindings.lua runs.
+    omarchy_root: Path | None = None
 
     @classmethod
     def from_env(cls) -> "Context":
@@ -144,7 +148,16 @@ class Context:
         plugin_root = home / ".config" / "omarchy" / "plugins" / PLUGIN_ID
         if not plugin_root.is_dir():
             plugin_root = None
-        return cls(home=home, state_dir=state_dir, default_clone=state_dir / "repo", plugin_root=plugin_root)
+        omarchy_root = Path(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy")
+        if not omarchy_root.is_dir():
+            omarchy_root = None
+        return cls(
+            home=home,
+            state_dir=state_dir,
+            default_clone=state_dir / "repo",
+            plugin_root=plugin_root,
+            omarchy_root=omarchy_root,
+        )
 
     @property
     def state_path(self) -> Path:
@@ -525,6 +538,11 @@ def canonical_shell_bytes(path: Path, within: Path | None = None) -> bytes | Non
     data = load_json(path, default=None, within=within)
     if not isinstance(data, dict):
         return read_bytes_bound(path, within=within)
+    return canonical_shell_json(data)
+
+
+def canonical_shell_data(data: dict[str, Any]) -> dict[str, Any]:
+    """shell.json without this plugin's own bar entry (edits data in place)."""
     bar = data.get("bar")
     if isinstance(bar, dict):
         layout = bar.get("layout")
@@ -537,14 +555,30 @@ def canonical_shell_bytes(path: Path, within: Path | None = None) -> bytes | Non
                     for entry in entries
                     if (entry.get("id") if isinstance(entry, dict) else entry) != PLUGIN_ID
                 ]
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return data
+
+
+def canonical_shell_json(data: dict[str, Any]) -> bytes:
+    return json.dumps(canonical_shell_data(data), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def file_hash(path: Path, rel: str, within: Path | None = None) -> str | None:
-    if rel == "omarchy/shell.json":
+    if rel == SHELL_REL:
         data = canonical_shell_bytes(path, within=within)
         return sha256_bytes(data) if data is not None else None
     return sha256_file(path, within=within)
+
+
+def file_hash_bytes(rel: str, data: bytes) -> str:
+    """file_hash() for content that is not on disk, such as a blob from git."""
+    if rel == SHELL_REL:
+        try:
+            parsed = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            return sha256_bytes(canonical_shell_json(parsed))
+    return sha256_bytes(data)
 
 
 def is_local_overlay_name(name: str) -> bool:
@@ -796,6 +830,7 @@ def run_git(
     check: bool = False,
     cwd: Path | None = None,
     disk_root: Path | None = None,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """disk_root enables the on-disk budget for operations that can grow the
     clone from untrusted data (clone, fetch, pull, merge, checkout).
@@ -813,6 +848,7 @@ def run_git(
     try:
         result = run_bounded(
             cmd,
+            input=input,
             timeout=timeout,
             env=git_env(),
             cwd=str(cwd) if cwd else None,
@@ -2689,13 +2725,17 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
         else:
             local_dependencies = []
             undefined_dependencies = []
-        if keys not in by_key:
+        previous = by_key.get(keys)
+        if previous is None:
             order.append(keys)
         by_key[keys] = {
             "keys": keys,
             "label": label,
             "kind": kind,
             "line": index,
+            # Every statement for this key (an unbind before its bind), so a
+            # removal takes the whole pair out.
+            "lines": (previous["lines"] if previous else []) + [index],
             "raw": raw,
             "sync_raw": sync_raw,
             "portable": portable,
@@ -2706,34 +2746,391 @@ def extract_bind_statements(text: str) -> list[dict[str, Any]]:
     return [by_key[key] for key in order]
 
 
+BINDINGS_REL = "hypr/bindings.lua"
+# How far back the clone's history is searched for the bindings.lua this
+# machine last synced, for state saved before shortcut baselines existed.
+SHORTCUT_BASELINE_SEARCH = 50
+# Hyprland's `code:N` is the X keycode (evdev + 8), named here by the key it
+# types on a US layout. Omarchy resolves binds against the first, Latin layout,
+# so `SUPER + code:54` and `SUPER + C` are one press, and Hyprland runs both.
+KEYCODE_KEYS = {
+    **{10 + i: key for i, key in enumerate("1234567890")},
+    **{24 + i: key for i, key in enumerate("QWERTYUIOP")},
+    **{38 + i: key for i, key in enumerate("ASDFGHJKL")},
+    **{52 + i: key for i, key in enumerate("ZXCVBNM")},
+}
+MODIFIER_ALIASES = {"CONTROL": "CTRL", "MOD1": "ALT", "MOD4": "SUPER", "WIN": "SUPER", "LOGO": "SUPER"}
+KEYCODE_RE = re.compile(r"code:(\d+)", re.IGNORECASE)
+
+
+def shortcut_forms(entry: dict[str, Any]) -> list[str]:
+    """The texts a statement matches by: as written, and with path locals inlined."""
+    raw = str(entry.get("raw") or "").strip()
+    sync = str(entry.get("sync_raw") or raw).strip()
+    return [raw] if sync == raw else [raw, sync]
+
+
+def shortcut_sides_match(a: dict[str, Any] | None, b: dict[str, Any] | None) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    return bool(set(shortcut_forms(a)) & set(shortcut_forms(b)))
+
+
+def shortcut_base(baseline: dict[str, Any] | None, keys: str) -> tuple[bool, list[str] | None]:
+    """(known, forms) for one key. forms is None when the key was on neither side.
+
+    A key missing from a saved baseline was absent on both sides. A key stored
+    as null had the two sides disagree when the baseline was taken, so its base
+    is unknown, as is every key when there is no baseline at all.
+    """
+    if baseline is None:
+        return False, None
+    if keys not in baseline:
+        return True, None
+    forms = baseline[keys]
+    if not isinstance(forms, list):
+        return False, None
+    return True, [str(f) for f in forms]
+
+
+def shortcut_at_base(entry: dict[str, Any] | None, forms: list[str] | None) -> bool:
+    if entry is None or forms is None:
+        return entry is None and forms is None
+    return bool(set(shortcut_forms(entry)) & set(forms))
+
+
+def shortcut_baseline_from_text(text: str) -> dict[str, list[str] | None]:
+    return {e["keys"]: shortcut_forms(e) for e in extract_bind_statements(text)}
+
+
+def next_shortcut_baseline(
+    local_text: str, repo_text: str, previous: dict[str, Any] | None
+) -> dict[str, list[str] | None]:
+    """Where both sides agree on a shortcut, that is its new merge base.
+
+    Everywhere else the old base stands, so a row left unticked keeps its
+    direction: a bind deleted here stays an outgoing removal instead of
+    turning into an incoming addition.
+    """
+    local_map = {e["keys"]: e for e in extract_bind_statements(local_text)}
+    repo_map = {e["keys"]: e for e in extract_bind_statements(repo_text)}
+    out: dict[str, list[str] | None] = {}
+    for keys in set(local_map) | set(repo_map) | set(previous or {}):
+        local_e = local_map.get(keys)
+        repo_e = repo_map.get(keys)
+        if shortcut_sides_match(local_e, repo_e):
+            if local_e is not None and repo_e is not None:
+                out[keys] = sorted(set(shortcut_forms(local_e)) | set(shortcut_forms(repo_e)))
+            continue
+        known, forms = shortcut_base(previous, keys)
+        if not known:
+            out[keys] = None
+        elif forms is not None:
+            out[keys] = forms
+    return out
+
+
+def synced_version(repo: Path, rel: str, stored_hash: str | None) -> bytes | None:
+    """The file as this machine last synced it: the merge base for its edits.
+
+    The stored hash names that version. Every sync either took the repo's
+    file or published this one, so the clone's history has it.
+    """
+    if not stored_hash or not (repo / ".git").exists():
+        return None
+    commits = git_out(repo, "rev-list", "-n", str(SHORTCUT_BASELINE_SEARCH), "HEAD", "--", rel).split()
+    if not commits:
+        return None
+    result = run_git(repo, ["cat-file", "--batch"], input="".join(f"{c}:{rel}\n" for c in commits))
+    if result.returncode != 0:
+        return None
+    # Blob sizes are bytes. git's output was UTF-8, so re-encoding is lossless
+    # for every file that could ever have matched the stored hash.
+    data = (result.stdout or "").encode("utf-8")
+    pos = 0
+    while pos < len(data):
+        end = data.find(b"\n", pos)
+        if end < 0:
+            break
+        header = data[pos:end].split()
+        pos = end + 1
+        if len(header) != 3 or header[1] != b"blob":
+            continue
+        try:
+            size = int(header[2])
+        except ValueError:
+            return None
+        blob = data[pos : pos + size]
+        pos += size + 1
+        if file_hash_bytes(rel, blob) == stored_hash:
+            return blob
+    return None
+
+
+def recover_shortcut_baseline(repo: Path, stored_hash: str | None) -> dict[str, list[str] | None] | None:
+    """Rebuild the shortcut merge base for state saved before it was tracked."""
+    base = synced_version(repo, BINDINGS_REL, stored_hash)
+    if base is None:
+        return None
+    return shortcut_baseline_from_text(base.decode("utf-8", errors="replace"))
+
+
+_MISSING = object()
+
+
+def merge_json_values(base: Any, local: Any, repo: Any, path: str, overlaps: list[str]) -> Any:
+    """Three-way merge of parsed JSON, key by key.
+
+    Where both sides changed the same value differently, keep this machine's
+    and record the key path in overlaps.
+    """
+    if local == repo:
+        return local
+    if local == base:
+        return repo
+    if repo == base:
+        return local
+    if isinstance(local, dict) and isinstance(repo, dict):
+        base_dict = base if isinstance(base, dict) else {}
+        out: dict[str, Any] = {}
+        for key in list(local) + [k for k in repo if k not in local]:
+            value = merge_json_values(
+                base_dict.get(key, _MISSING),
+                local.get(key, _MISSING),
+                repo.get(key, _MISSING),
+                f"{path}.{key}" if path else key,
+                overlaps,
+            )
+            if value is not _MISSING:
+                out[key] = value
+        return out
+    overlaps.append(path or "(whole file)")
+    return local
+
+
+def merge_text(ctx: Context, base: bytes, local: bytes, repo: bytes) -> tuple[bytes, int] | None:
+    """Line merge with git. Overlapping hunks keep this machine's lines."""
+    if any(b"\0" in data or len(data) > MAX_TEXT_FILE_BYTES for data in (base, local, repo)):
+        return None
+    ctx.state_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ctx.state_dir, prefix=".merge-") as tmp:
+        names = []
+        for name, data in (("local", local), ("base", base), ("repo", repo)):
+            path = Path(tmp) / name
+            path.write_bytes(data)
+            names.append(str(path))
+        plain = run_git(None, ["merge-file", "-p", *names])
+        # Exit status is the number of overlapping hunks; above 127 is an error.
+        if not 0 <= plain.returncode <= 127:
+            return None
+        if plain.returncode == 0:
+            return plain.stdout.encode("utf-8"), 0
+        ours = run_git(None, ["merge-file", "-p", "--ours", *names])
+        if ours.returncode != 0:
+            return None
+        return ours.stdout.encode("utf-8"), plain.returncode
+
+
+def merge_versions(ctx: Context, rel: str, base: bytes, local: bytes, repo: bytes) -> tuple[bytes, list[str]] | None:
+    """(merged, overlaps), or None when the file cannot be merged."""
+    if rel == SHELL_REL:
+        try:
+            parsed = [json.loads(data.decode("utf-8")) for data in (base, local, repo)]
+        except (UnicodeDecodeError, ValueError):
+            return None
+        if not all(isinstance(p, dict) for p in parsed):
+            return None
+        base_data, local_data, repo_data = (canonical_shell_data(p) for p in parsed)
+        overlaps: list[str] = []
+        merged = merge_json_values(base_data, local_data, repo_data, "", overlaps)
+        return (json.dumps(merged, indent=2, ensure_ascii=False) + "\n").encode("utf-8"), overlaps
+    result = merge_text(ctx, base, local, repo)
+    if result is None:
+        return None
+    merged_text, hunks = result
+    return merged_text, [f"{hunks} overlapping edit{'s' if hunks != 1 else ''}"] if hunks else []
+
+
+def is_mergeable_path(item: dict[str, Any]) -> bool:
+    """Plain config files. Shortcuts, themes, and code bundles merge their own way."""
+    rel = item["path"]
+    return (
+        bool(item.get("portable", True))
+        and rel != BINDINGS_REL
+        and item.get("group") != "theme"
+        and not is_bundled_path(rel)
+        and not is_executable_payload(rel)
+        and bool(item.get("local_exists"))
+        and bool(item.get("repo_exists"))
+    )
+
+
+def plan_merge(ctx: Context, repo: Path, item: dict[str, Any], stored_hash: str | None) -> dict[str, Any] | None:
+    """How a file both sides edited combines, measured against the last sync."""
+    rel = item["path"]
+    base = synced_version(repo, rel, stored_hash)
+    if base is None:
+        return None
+    local = read_bytes_bound(Path(item["local_path"]), within=ctx.home)
+    remote = read_bytes_bound(Path(item["repo_path"]), within=repo)
+    if local is None or remote is None:
+        return None
+    result = merge_versions(ctx, rel, base, local, remote)
+    if result is None:
+        return None
+    merged, overlaps = result
+    merged_hash = file_hash_bytes(rel, merged)
+    return {
+        "merged": merged,
+        "overlaps": overlaps,
+        "same_as_local": merged_hash == item.get("local_hash"),
+        "same_as_repo": merged_hash == item.get("repo_hash"),
+    }
+
+
+def current_shortcut_baseline(repo: Path, state: dict[str, Any]) -> dict[str, list[str] | None] | None:
+    saved = state.get("shortcut_baseline")
+    if isinstance(saved, dict):
+        return {
+            str(keys): [str(f) for f in forms] if isinstance(forms, list) else None
+            for keys, forms in saved.items()
+        }
+    return recover_shortcut_baseline(repo, (state.get("file_hashes") or {}).get(BINDINGS_REL))
+
+
+def omarchy_default_bindings_text(ctx: Context) -> str:
+    """Omarchy's own bindings, which run before hypr/bindings.lua."""
+    if ctx.omarchy_root is None:
+        return ""
+    folder = ctx.omarchy_root / "default" / "hypr" / "bindings"
+    try:
+        paths = sorted(p for p in folder.glob("*.lua") if p.is_file())
+    except OSError:
+        return ""
+    return "\n".join(read_text(p, within=ctx.omarchy_root) for p in paths)
+
+
+def bind_chord(keys: str) -> tuple[frozenset[str], str]:
+    parts = [p.strip().upper() for p in keys.split("+") if p.strip()]
+    if not parts:
+        return frozenset(), ""
+    return frozenset(MODIFIER_ALIASES.get(p, p) for p in parts[:-1]), parts[-1]
+
+
+def keycode_alias(keys: str) -> str | None:
+    """`SUPER + code:54` -> `SUPER + C`: the bind it fires alongside."""
+    head, _, last = keys.rpartition("+")
+    match = KEYCODE_RE.fullmatch(last.strip())
+    name = KEYCODE_KEYS.get(int(match.group(1))) if match else None
+    if not name:
+        return None
+    return f"{head.strip()} + {name}" if head.strip() else name
+
+
+def keycode_twins(entries: dict[str, dict[str, Any]]) -> dict[tuple[frozenset[str], str], str]:
+    """Chord a keycode bind stands in for -> that bind's keys."""
+    twins: dict[tuple[frozenset[str], str], str] = {}
+    for keys, entry in entries.items():
+        alias = keycode_alias(keys) if entry["kind"] == "bind" else None
+        if alias:
+            twins[bind_chord(alias)] = keys
+    return twins
+
+
+def bound_chords(*texts: str) -> set[tuple[frozenset[str], str]]:
+    """Chords still bound after running each file in order."""
+    bound: set[tuple[frozenset[str], str]] = set()
+    for text in texts:
+        for entry in extract_bind_statements(text):
+            chord = bind_chord(entry["keys"])
+            if entry["kind"] == "unbind":
+                bound.discard(chord)
+            else:
+                bound.add(chord)
+    return bound
+
+
+def _lua_line_balanced(line: str) -> bool:
+    """True when a statement closes every bracket it opens on this one line."""
+    depth = 0
+    quote: str | None = None
+    escape = False
+    for i, ch in enumerate(line):
+        if quote:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif line.startswith("--", i):
+            break
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0 and quote is None
+
+
+def shortcut_lines_removable(lines: list[str], entry: dict[str, Any]) -> bool:
+    """A bind whose body continues on later lines is never deleted line by line."""
+    indexes = entry.get("lines") or [entry["line"]]
+    return all(0 <= i < len(lines) and _lua_line_balanced(lines[i]) for i in indexes)
+
+
 def shortcut_diff(
     local_path: Path,
     repo_path: Path,
     stored_hash: str | None = None,
     local_within: Path | None = None,
     repo_within: Path | None = None,
+    baseline: dict[str, Any] | None = None,
+    defaults_text: str = "",
 ) -> list[dict[str, Any]]:
+    """Per-shortcut drift between this machine and the repo.
+
+    With a baseline (the shortcuts both sides last agreed on) this is a
+    three-way merge: a bind deleted here is an outgoing removal, not an
+    incoming addition, and a bind deleted in the repo is an incoming removal.
+    Keys with no known base fall back to the two-way comparison.
+    """
     local_text = read_text(local_path, within=local_within) if local_path.is_file() else ""
     repo_text = read_text(repo_path, within=repo_within) if repo_path.is_file() else ""
     local_map = {e["keys"]: e for e in extract_bind_statements(local_text)}
     repo_map = {e["keys"]: e for e in extract_bind_statements(repo_text)}
     _, local_names = extract_portable_locals(local_text)
     _, repo_names = extract_portable_locals(repo_text)
-    local_file_hash = file_hash(local_path, "hypr/bindings.lua", within=local_within) if local_path.is_file() else None
-    repo_file_hash = file_hash(repo_path, "hypr/bindings.lua", within=repo_within) if repo_path.is_file() else None
+    local_file_hash = file_hash(local_path, BINDINGS_REL, within=local_within) if local_path.is_file() else None
+    repo_file_hash = file_hash(repo_path, BINDINGS_REL, within=repo_within) if repo_path.is_file() else None
     local_at_baseline = bool(stored_hash) and local_file_hash == stored_hash
     repo_at_baseline = bool(stored_hash) and repo_file_hash == stored_hash
+    bound = bound_chords(defaults_text, local_text) | bound_chords(defaults_text, repo_text)
+    local_twins = keycode_twins(local_map)
+    repo_twins = keycode_twins(repo_map)
     rows = []
     for keys in sorted(set(local_map) | set(repo_map)):
         local_e = local_map.get(keys)
         repo_e = repo_map.get(keys)
+        if shortcut_sides_match(local_e, repo_e):
+            continue
         local_raw = local_e["raw"] if local_e else ""
         repo_raw = repo_e["raw"] if repo_e else ""
-        local_sync = ((local_e or {}).get("sync_raw") or local_raw).strip()
-        repo_sync = ((repo_e or {}).get("sync_raw") or repo_raw).strip()
-        if local_e and repo_e and (local_sync == repo_sync or local_raw.strip() == repo_raw.strip()):
-            continue
-        if local_e and not repo_e:
+        known, base_forms = shortcut_base(baseline, keys)
+        if known:
+            local_at_base = shortcut_at_base(local_e, base_forms)
+            repo_at_base = shortcut_at_base(repo_e, base_forms)
+            if local_at_base and not repo_at_base:
+                status = "added-repo" if base_forms is None else "repo"
+            elif repo_at_base and not local_at_base:
+                status = "added-local" if base_forms is None else "local"
+            else:
+                status = "both"
+            change = "added" if base_forms is None and status != "both" else "changed"
+        elif local_e and not repo_e:
             status = "added-local"
             change = "added"
         elif repo_e and not local_e:
@@ -2753,16 +3150,39 @@ def shortcut_diff(
             # which repo binds land locally. Uncheck to keep the local bind.
             status = "repo"
             change = "changed"
+        # The side being copied no longer has the bind: syncing deletes it.
+        removal = (status == "repo" and repo_e is None) or (status == "local" and local_e is None)
+        if removal:
+            change = "removed"
         local_label = (local_e or {}).get("label") or ""
         repo_label = (repo_e or {}).get("label") or ""
         local_portable = shortcut_entry_portable_to(local_e, repo_names) if local_e else True
         repo_portable = shortcut_entry_portable_to(repo_e, local_names) if repo_e else True
         skip_reason = ""
+        duplicate_of = ""
+        moved_to = ""
+        incoming = status in {"added-repo", "repo"}
+        outgoing = status in {"added-local", "local"}
+        source_e, dest_e = (repo_e, local_e) if incoming else (local_e, repo_e) if outgoing else (None, None)
+        if source_e and source_e["kind"] == "bind":
+            alias = keycode_alias(keys)
+            if alias and bind_chord(alias) in bound:
+                duplicate_of = alias
+        if (incoming or outgoing) and dest_e and dest_e["kind"] == "bind" and (source_e is None or source_e["kind"] == "unbind"):
+            # The other side dropped this key only because a keycode copy
+            # (`code:N`) now does the job there. Taking the drop alone, without
+            # that copy, leaves the destination with nothing on the key.
+            twin = (repo_twins if incoming else local_twins).get(bind_chord(keys), "")
+            dest_map = local_map if incoming else repo_map
+            if twin and (dest_map.get(twin) or {}).get("kind") != "bind":
+                moved_to = twin
         if status in {"added-repo", "repo"}:
             label = repo_label or local_label or keys
             skip_reason = str((repo_e or {}).get("skip_reason") or "") if not repo_portable else ""
             if skip_reason:
                 detail = f"skipped — {skip_reason}"
+            elif removal:
+                detail = label
             else:
                 detail = f"was: {local_label}" if change == "changed" and local_label else "new in repo"
         elif status in {"added-local", "local"}:
@@ -2770,17 +3190,32 @@ def shortcut_diff(
             skip_reason = str((local_e or {}).get("skip_reason") or "") if not local_portable else ""
             if skip_reason:
                 detail = f"skipped — {skip_reason}"
+            elif removal:
+                detail = label
             else:
                 detail = f"repo has: {repo_label}" if change == "changed" and repo_label else "new on this machine"
         else:
             label = local_label or repo_label or keys
             skip_reason = str((local_e or {}).get("skip_reason") or (repo_e or {}).get("skip_reason") or "")
-            detail = f"this machine: {local_label} · repo: {repo_label}"
+            detail = f"this machine: {local_label or 'removed'} · repo: {repo_label or 'removed'}"
             if skip_reason:
                 detail += f" · skipped — {skip_reason}"
+        if skip_reason:
+            pass
+        elif duplicate_of:
+            detail = f"{label} · same key as {duplicate_of}, so one press runs both"
+        elif moved_to:
+            where = "the repo" if incoming else "this machine"
+            verb = "drops" if removal else "unbinds"
+            detail = f"{verb} {dest_e['label']} · {where} runs it from {moved_to} instead"
+        elif not removal and source_e and dest_e and source_e["kind"] == "unbind" and dest_e["kind"] == "bind":
+            detail = f"unbinds {dest_e['label']}"
         source_portable = (
             repo_portable if status in {"added-repo", "repo"} else local_portable if status in {"added-local", "local"} else (local_portable and repo_portable)
         )
+        # Deletions and keycode copies that double-fire or strand a key are
+        # never ticked for you.
+        opt_in = removal or bool(duplicate_of) or bool(moved_to)
         rows.append(
             {
                 "keys": keys,
@@ -2797,8 +3232,11 @@ def shortcut_diff(
                 "local_portable": local_portable,
                 "repo_portable": repo_portable,
                 "skip_reason": skip_reason,
-                "default_apply": status in {"added-repo", "repo"} and repo_portable,
-                "default_publish": status in {"added-local", "local"} and local_portable,
+                "removal": removal,
+                "duplicate_of": duplicate_of,
+                "moved_to": moved_to,
+                "default_apply": status in {"added-repo", "repo"} and repo_portable and not opt_in,
+                "default_publish": status in {"added-local", "local"} and local_portable and not opt_in,
             }
         )
     return rows
@@ -2809,19 +3247,27 @@ def upsert_shortcut_lines(dest_text: str, source_entries: dict[str, dict[str, An
     _, dest_local_names = extract_portable_locals(dest_text)
     lines = dest_text.splitlines(keepends=True)
     replacements: dict[int, str] = {}
+    dropped: set[int] = set()
     append: list[str] = []
     for key in selected_keys:
         src = source_entries.get(key)
-        if not src or not shortcut_entry_portable_to(src, dest_local_names):
+        dest = dest_entries.get(key)
+        if src is None:
+            # Gone from the source: take every statement for it out here too.
+            if dest is not None and shortcut_lines_removable(lines, dest):
+                dropped.update(dest.get("lines") or [dest["line"]])
+            continue
+        if not shortcut_entry_portable_to(src, dest_local_names):
             continue
         raw = str(src.get("sync_raw") or src["raw"]).rstrip("\n") + "\n"
-        dest = dest_entries.get(key)
         if dest is not None and 0 <= dest["line"] < len(lines):
             replacements[dest["line"]] = raw
         else:
             append.append(raw)
     out: list[str] = []
     for i, line in enumerate(lines):
+        if i in dropped:
+            continue
         out.append(replacements[i] if i in replacements else line)
     if append:
         body = "".join(out)
@@ -2860,11 +3306,20 @@ def filter_portable_shortcuts(
     source_text: str, keys: list[str], destination_text: str = ""
 ) -> tuple[list[str], list[dict[str, str]]]:
     entries = {e["keys"]: e for e in extract_bind_statements(source_text)}
+    destination_entries = {e["keys"]: e for e in extract_bind_statements(destination_text)}
+    destination_lines = destination_text.splitlines(keepends=True)
     _, destination_local_names = extract_portable_locals(destination_text)
     kept: list[str] = []
     skipped: list[dict[str, str]] = []
     for key in keys:
         entry = entries.get(key)
+        removing = destination_entries.get(key) if entry is None else None
+        if removing is not None:
+            if shortcut_lines_removable(destination_lines, removing):
+                kept.append(key)
+            else:
+                skipped.append({"keys": key, "reason": "spans several lines, so it is not removed automatically"})
+            continue
         if entry and shortcut_entry_portable_to(entry, destination_local_names):
             kept.append(key)
         else:
@@ -2944,6 +3399,7 @@ def drop_unloadable_bindings_file(
             row["keys"]
             for row in diff_shortcuts
             if not row.get("hidden")
+            and not row.get("removal")
             and row.get(portable_flag, True)
             and row.get("status") in incoming_statuses
         ]
@@ -3404,6 +3860,21 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
     }
     for item in collect_inventory(ctx, repo):
         status = classify_file(item, stored.get(item["path"]))
+        merge = plan_merge(ctx, repo, item, stored.get(item["path"])) if status == "both" and is_mergeable_path(item) else None
+        merge_note = ""
+        if merge and not merge["overlaps"] and merge["same_as_local"]:
+            # The repo's edits are already in this file: only this side is ahead.
+            status = "local"
+            merge_note = "Already has the repo's edits"
+        elif merge and not merge["overlaps"] and merge["same_as_repo"]:
+            status = "repo"
+            merge_note = "Already has this machine's edits"
+        item["mergeable"] = bool(merge) and status == "both" and not merge["same_as_local"] and not merge["same_as_repo"]
+        item["merge_overlaps"] = list(merge["overlaps"]) if item["mergeable"] else []
+        if item["mergeable"]:
+            merge_note = "Merge keeps both sides' edits"
+            if item["merge_overlaps"]:
+                merge_note += f"; both changed {', '.join(item['merge_overlaps'])}, so Merge keeps this machine's there"
         item["status"] = status
         item["hidden"] = is_hidden_item("f", item["path"], hidden_keys)
         plugin_id = plugin_id_from_path(item["path"])
@@ -3417,6 +3888,10 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
             and not is_executable_payload(item["path"])
         )
         item["default_publish"] = default_publish_status(status) and item["local_exists"] and not item["hidden"]
+        # A merge that touches no line both sides edited loses nothing: pick it.
+        item["default_side"] = "merge" if item["mergeable"] and not item["merge_overlaps"] else ""
+        if item["default_side"] and not item["hidden"]:
+            item["default_apply"] = item["default_publish"] = True
         # A tracked file gone from one side is a removal, not a one-sided edit:
         # publishing it deletes it from the repo, applying it deletes it here.
         # Never default-checked above — a delete is always an explicit tick.
@@ -3446,6 +3921,8 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
                     local_within=ctx.home,
                     repo_within=repo,
                 )
+                if merge_note:
+                    sem_summary = f"{merge_note} · {sem_summary}" if sem_summary else merge_note
                 item["semantic_summary"] = sem_summary
                 item["changes"] = changes
                 if sem_summary:
@@ -3464,9 +3941,11 @@ def annotate_diff(ctx: Context, repo: Path, state: dict[str, Any]) -> dict[str, 
     shortcuts = shortcut_diff(
         ctx.config_hypr / "bindings.lua",
         repo / "hypr" / "bindings.lua",
-        stored.get("hypr/bindings.lua"),
+        stored.get(BINDINGS_REL),
         local_within=ctx.home,
         repo_within=repo,
+        baseline=current_shortcut_baseline(repo, state),
+        defaults_text=omarchy_default_bindings_text(ctx),
     )
     for s in shortcuts:
         s["hidden"] = is_hidden_item("s", s["keys"], hidden_keys)
@@ -4120,6 +4599,46 @@ def reload_desktop() -> dict[str, str]:
     return notes
 
 
+def merge_selection(files: list[dict[str, Any]], requested: list[str] | None) -> list[dict[str, Any]]:
+    wanted = {p for p in (requested or []) if p}
+    return [i for i in files if i["path"] in wanted and i.get("mergeable") and not i.get("hidden")]
+
+
+def write_merged_files(
+    ctx: Context, repo: Path, items: list[dict[str, Any]], stored: dict[str, Any], direction: str
+) -> list[str]:
+    """Write each file's three-way merge here (apply) or into the repo (publish).
+
+    The other side still has only its own edits, so the row turns into an
+    outgoing (or incoming) one until the next Publish (or Apply) carries the
+    merge across.
+    """
+    done = []
+    for item in items:
+        plan = plan_merge(ctx, repo, item, stored.get(item["path"]))
+        if plan is None:
+            continue
+        dest, root = (Path(item["local_path"]), ctx.home) if direction == "apply" else (Path(item["repo_path"]), repo)
+        try:
+            st = os.lstat(dest)
+            mode = stat.S_IMODE(st.st_mode) if stat.S_ISREG(st.st_mode) else 0o644
+        except OSError:
+            mode = 0o644
+        atomic_write_text(dest, plan["merged"].decode("utf-8"), mode=mode, within=root)
+        done.append(item["path"])
+    return done
+
+
+def save_shortcut_baseline(
+    ctx: Context, repo: Path, state: dict[str, Any], previous: dict[str, Any] | None
+) -> None:
+    local = ctx.config_hypr / "bindings.lua"
+    remote = repo / "hypr" / "bindings.lua"
+    local_text = read_text(local, within=ctx.home) if local.is_file() else ""
+    repo_text = read_text(remote, within=repo) if remote.is_file() else ""
+    state["shortcut_baseline"] = next_shortcut_baseline(local_text, repo_text, previous)
+
+
 def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
     state = load_state(ctx)
     repo = configured_repo(ctx, state)
@@ -4138,6 +4657,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
+    shortcut_base_before = current_shortcut_baseline(repo, state)
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
@@ -4162,17 +4682,23 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         )
     if requested_shortcuts and wanted is not None:
         wanted.discard("hypr/bindings.lua")
+    merges = merge_selection(diff["files"], getattr(args, "merge", None))
+    merging = {i["path"] for i in merges}
     unresolved_both = [
         i
         for i in diff["files"]
-        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
+        if not i.get("hidden")
+        and i["status"] == "both"
+        and i["path"] not in merging
+        and (i["portable"] or args.include_machine)
+        and (wanted is None or i["path"] in wanted)
     ]
     if unresolved_both and wanted is None:
         raise SyncError(
-            "Some files changed on both this machine and the repo. Pick Keep local or Take repo for each, then Apply.",
+            "Some files changed on both this machine and the repo. Pick Keep local, Take repo, or Merge for each, then Apply.",
             extra={"both": [i["path"] for i in unresolved_both]},
         )
-    chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "apply")
+    chosen = [i for i in selected_items(diff["files"], wanted, bool(args.include_machine), "apply") if i["path"] not in merging]
     if requested_shortcuts:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
     chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
@@ -4185,7 +4711,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-repo", "repo", "differs"},
         "repo_portable",
     )
-    if not chosen and not shortcut_keys:
+    if not chosen and not shortcut_keys and not merges:
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = []
         snap["removed"] = []
@@ -4204,6 +4730,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 applied.append(item["path"])
         if shortcut_keys:
             applied.append("hypr/bindings.lua")
+        applied.extend(i["path"] for i in merges)
         snap = build_snapshot(ctx, fetch=False)
         snap["applied"] = applied
         snap["removed"] = removed
@@ -4219,7 +4746,7 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
 
     shell_path = ctx.config_omarchy / "shell.json"
     section, widget_entry, widget_index = extract_widget_entry(load_json(shell_path, default={}, within=ctx.home))
-    backup_targets = [i for i in chosen if i["local_exists"]]
+    backup_targets = [i for i in chosen if i["local_exists"]] + merges
     bindings_local = ctx.config_hypr / "bindings.lua"
     if shortcut_keys and bindings_local.is_file():
         backup_targets.append(
@@ -4261,6 +4788,8 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             source_within=repo,
         ):
             applied.append("hypr/bindings.lua")
+    merged_here = write_merged_files(ctx, repo, merges, state.get("file_hashes") or {}, "apply")
+    applied.extend(merged_here)
     restore_widget_entry(shell_path, section, widget_entry, widget_index, within=ctx.home)
 
     # Refresh hashes for every tracked file after apply.
@@ -4278,9 +4807,14 @@ def cmd_apply(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 hashes[item["path"]] = item["local_hash"]
         elif item["local_exists"] and item["repo_exists"] and item["local_hash"] == item["repo_hash"] and item["local_hash"]:
             hashes[item["path"]] = item["local_hash"]
+        if item["path"] in merged_here and item["repo_hash"]:
+            # This machine now holds the repo's edits plus its own: measured
+            # against the repo's file, the merge is an outgoing change.
+            hashes[item["path"]] = item["repo_hash"]
     for rel in removed:
         hashes.pop(rel, None)
     state["file_hashes"] = hashes
+    save_shortcut_baseline(ctx, repo, state, shortcut_base_before)
     state["plugin_list"] = plugin_list_baseline(ctx, repo, state)
     state["last_apply_at"] = now_iso()
     state["last_applied_commit"] = git_fields.get("head_full") or git_out(repo, "rev-parse", "HEAD")
@@ -4352,6 +4886,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             extra={"ahead": git_fields["ahead"], "behind": git_fields["behind"]},
         )
     diff = annotate_diff(ctx, repo, state)
+    shortcut_base_before = current_shortcut_baseline(repo, state)
     explicit = bool(getattr(args, "explicit", False))
     shortcut_keys = [s for s in (getattr(args, "shortcut", None) or []) if s]
     plugin_ids = [p for p in (getattr(args, "plugin", None) or []) if p]
@@ -4382,17 +4917,23 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         )
     if requested_shortcuts and wanted is not None:
         wanted.discard("hypr/bindings.lua")
+    merges = merge_selection(diff["files"], getattr(args, "merge", None))
+    merging = {i["path"] for i in merges}
     unresolved_both = [
         i
         for i in diff["files"]
-        if not i.get("hidden") and i["status"] == "both" and (i["portable"] or args.include_machine) and (wanted is None or i["path"] in wanted)
+        if not i.get("hidden")
+        and i["status"] == "both"
+        and i["path"] not in merging
+        and (i["portable"] or args.include_machine)
+        and (wanted is None or i["path"] in wanted)
     ]
     if unresolved_both and wanted is None:
         raise SyncError(
-            "Some files changed on both this machine and the repo. Pick Keep local or Take repo for each, then Publish.",
+            "Some files changed on both this machine and the repo. Pick Keep local, Take repo, or Merge for each, then Publish.",
             extra={"both": [i["path"] for i in unresolved_both]},
         )
-    chosen = selected_items(diff["files"], wanted, bool(args.include_machine), "publish")
+    chosen = [i for i in selected_items(diff["files"], wanted, bool(args.include_machine), "publish") if i["path"] not in merging]
     if requested_shortcuts:
         chosen = [i for i in chosen if i["path"] != "hypr/bindings.lua"]
     chosen, shortcut_keys, skipped_shortcuts = drop_unloadable_bindings_file(
@@ -4405,7 +4946,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         {"added-local", "local", "differs"},
         "local_portable",
     )
-    if not chosen and not shortcut_keys and not list_rows:
+    if not chosen and not shortcut_keys and not list_rows and not merges:
         if getattr(args, "dry_run", False):
             snap = build_snapshot(ctx, fetch=False)
             snap["published"] = []
@@ -4445,6 +4986,7 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
                 published.append(item["path"])
         if shortcut_keys:
             published.append("hypr/bindings.lua")
+        published.extend(i["path"] for i in merges)
         plugin_list_ids = [row["id"] for row in list_rows]
         snap = build_snapshot(ctx, fetch=False)
         snap["published"] = published
@@ -4487,6 +5029,8 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
             source_within=ctx.home,
         ):
             published.append("hypr/bindings.lua")
+    merged_there = write_merged_files(ctx, repo, merges, state.get("file_hashes") or {}, "publish")
+    published.extend(merged_there)
     plugin_list_ids = publish_plugin_list(ctx, repo, list_rows)
 
     strip_plugin_git_dirs(repo)
@@ -4524,12 +5068,17 @@ def cmd_publish(ctx: Context, args: argparse.Namespace) -> dict[str, Any]:
         if item["local_exists"] and item["repo_exists"] and item["local_hash"] == item["repo_hash"] and item["local_hash"]:
             hashes[item["path"]] = item["local_hash"]
         elif item["path"] in published:
-            live = sha256_file(Path(item["repo_path"]), within=repo)
+            live = file_hash(Path(item["repo_path"]), item["path"], within=repo)
             if live:
                 hashes[item["path"]] = live
+        if item["path"] in merged_there and item["local_hash"]:
+            # The repo now holds both sides' edits; this machine still has
+            # only its own, so the merge comes back here as incoming.
+            hashes[item["path"]] = item["local_hash"]
     for rel in removed:
         hashes.pop(rel, None)
     state["file_hashes"] = hashes
+    save_shortcut_baseline(ctx, repo, state, shortcut_base_before)
     state["plugin_list"] = plugin_list_baseline(ctx, repo, state)
     state["last_publish_at"] = now_iso()
     save_state(ctx, state)
@@ -5091,6 +5640,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--files", default=None)
     parser.add_argument("--explicit", action="store_true")
     parser.add_argument("--shortcut", action="append", default=None)
+    parser.add_argument("--merge", action="append", default=None)
     parser.add_argument("--plugin", action="append", default=None)
     parser.add_argument("--list-plugin", action="append", default=None)
     parser.add_argument("--theme", action="store_true")

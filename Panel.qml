@@ -172,7 +172,10 @@ Panel {
     var n = 0
     var i
     for (i = 0; i < bothFiles.length; i++) {
-      if (isPicked("f", bothFiles[i].path) && !bothPicks[bothFiles[i].path]) n++
+      var side = bothPicks[bothFiles[i].path]
+      // A Merge pick left over from before the file stopped merging cleanly
+      // would otherwise be skipped by both Apply and Publish without a word.
+      if (isPicked("f", bothFiles[i].path) && (!side || (side === "merge" && !bothFiles[i].mergeable))) n++
     }
     for (i = 0; i < bothShortcuts.length; i++) {
       if (isPicked("s", bothShortcuts[i].keys) && !bothPicks["s:" + bothShortcuts[i].keys]) n++
@@ -293,6 +296,17 @@ Panel {
     seedReview(outgoingItems)
     seedReview(bothItems)
     picks = next
+    // A merge that overlaps nowhere loses nothing, so it starts as the choice.
+    var sides = cloneMap(bothPicks)
+    var seeded = false
+    for (i = 0; i < otherFiles.length; i++) {
+      item = otherFiles[i]
+      if (item.default_side && !(item.path in sides)) {
+        sides[item.path] = item.default_side
+        seeded = true
+      }
+    }
+    if (seeded) bothPicks = sides
   }
 
   function reviewChanges() { activeTab = 1 }
@@ -382,6 +396,17 @@ Panel {
         continue
       }
       if (f.status === "repo" || f.status === "added-repo" || f.status === "differs") out.push(f.path)
+    }
+    return out
+  }
+
+  // Both Apply and Publish carry a Merge: Apply writes it here, Publish writes
+  // it to the repo, and the row then waits on the other button.
+  function selectedMergeFiles() {
+    var out = []
+    for (var i = 0; i < otherFiles.length; i++) {
+      var f = otherFiles[i]
+      if (f.status === "both" && f.mergeable && isPicked("f", f.path) && bothPicks[f.path] === "merge") out.push(f.path)
     }
     return out
   }
@@ -548,7 +573,7 @@ Panel {
 
   function requestApply() {
     if (unresolvedBoth > 0) {
-      lastError = "Pick Keep local or Take repo for each file that changed on both sides."
+      lastError = "Pick Keep local, Take repo, or Merge for each file that changed on both sides."
       activeTab = 1
       return
     }
@@ -557,7 +582,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedApplyFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme()) {
+    if (selectedApplyFiles().length + selectedMergeFiles().length + selectedApplyShortcuts().length + selectedApplyPlugins().length + selectedBundleFiles("apply").length === 0 && !selectedApplyTheme()) {
       lastError = "Check the incoming shortcuts, plugins, or files you want to apply."
       activeTab = 1
       return
@@ -567,7 +592,7 @@ Panel {
 
   function requestPublish() {
     if (unresolvedBoth > 0) {
-      lastError = "Pick Keep local or Take repo for each file that changed on both sides."
+      lastError = "Pick Keep local, Take repo, or Merge for each file that changed on both sides."
       activeTab = 1
       return
     }
@@ -576,7 +601,7 @@ Panel {
       activeTab = 1
       return
     }
-    if (selectedPublishFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedPublishListPlugins().length + selectedBundleFiles("publish").length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
+    if (selectedPublishFiles().length + selectedMergeFiles().length + selectedPublishShortcuts().length + selectedPublishPlugins().length + selectedPublishListPlugins().length + selectedBundleFiles("publish").length === 0 && !selectedPublishTheme() && Number(status.ahead || 0) === 0) {
       lastError = "Check the local shortcuts, plugins, or files you want to publish."
       activeTab = 1
       return
@@ -596,6 +621,8 @@ Panel {
       var ai
       for (ai = 0; ai < ashort.length; ai++) args.push("--shortcut", ashort[ai])
       for (ai = 0; ai < aplugs.length; ai++) args.push("--plugin", aplugs[ai])
+      var amerge = selectedMergeFiles()
+      for (ai = 0; ai < amerge.length; ai++) args.push("--merge", amerge[ai])
       if (selectedApplyTheme()) args.push("--theme")
       run(args)
     } else if (kind === "publish") {
@@ -607,6 +634,8 @@ Panel {
       var pi
       for (pi = 0; pi < pshort.length; pi++) pargs.push("--shortcut", pshort[pi])
       for (pi = 0; pi < pplugs.length; pi++) pargs.push("--plugin", pplugs[pi])
+      var pmerge = selectedMergeFiles()
+      for (pi = 0; pi < pmerge.length; pi++) pargs.push("--merge", pmerge[pi])
       var plist = selectedPublishListPlugins()
       for (pi = 0; pi < plist.length; pi++) pargs.push("--list-plugin", plist[pi])
       if (selectedPublishTheme()) pargs.push("--theme")
@@ -1620,7 +1649,7 @@ Panel {
         }
         ChangeSection {
           title: "Both sides"
-          subtitle: "Pick Keep local or Take repo on each row"
+          subtitle: "Pick Keep local, Take repo, or Merge on each row"
           mixed: true
           files: root.bothItems
           bulkPickable: false
@@ -1651,7 +1680,7 @@ Panel {
         visible: !root.showingHidden && root.unresolvedBoth > 0
         width: parent.width
         textFormat: Text.PlainText
-        text: "Checked items that changed on both sides still need Keep local or Take repo."
+        text: "Checked items that changed on both sides still need Keep local, Take repo, or Merge."
         color: root.urgent
         font.family: root.fontFamily
         font.pixelSize: Style.font.bodySmall
@@ -1804,7 +1833,7 @@ Panel {
       ChangeSection {
         visible: !root.showingHidden && root.bothItems.length > 0
         title: "Both sides"
-        subtitle: "Pick Keep local or Take repo on each row"
+        subtitle: "Pick Keep local, Take repo, or Merge on each row"
         mixed: true
         files: root.bothItems
         bulkPickable: false
@@ -2752,6 +2781,16 @@ Panel {
                   bordered: true
                   onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "repo")
                 }
+                Button {
+                  visible: !!catRowBox.modelData.mergeable
+                  text: "Merge"
+                  fontSize: Style.font.caption
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  selected: root.bothPicks[catRowBox.bothKey] === "merge"
+                  bordered: true
+                  onClicked: root.selectSide(catRowBox.rowKind, catRowBox.rowId, "merge")
+                }
               }
 
               Button {
@@ -3131,6 +3170,16 @@ Panel {
               selected: root.bothPicks[rowBox.bothKey] === "repo"
               bordered: true
               onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "repo")
+            }
+            Button {
+              visible: !!rowBox.modelData.mergeable
+              text: "Merge"
+              fontSize: Style.font.caption
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              selected: root.bothPicks[rowBox.bothKey] === "merge"
+              bordered: true
+              onClicked: root.selectSide(rowBox.rowKind, rowBox.rowId, "merge")
             }
           }
 

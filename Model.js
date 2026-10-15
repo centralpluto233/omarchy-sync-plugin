@@ -127,6 +127,8 @@ function reviewItem(kind, id, label, summary, status, typeLabel, both, changedCo
     changed_count: changedCount || 0,
     hidden: !!hidden,
     removal: false,
+    // A file both sides edited that a three-way merge can combine.
+    mergeable: false,
     // Rows with an action (Install/Update) are buttons, not Apply/Publish picks.
     pickable: true,
     action: "",
@@ -269,7 +271,7 @@ function appendShortcuts(out, list, summaryField, both, hiddenMap) {
   for (var i = 0; i < rows.length; i++) {
     var s = rows[i]
     if (isItemHidden("s", s.keys, hiddenMap, s)) continue
-    var sum = (summaryField === "detail" || s.portable === false)
+    var sum = (summaryField === "detail" || s.portable === false || s.duplicate_of)
       ? (s.detail || s.skip_reason || s.label || "")
       : (s.label || "")
     var row = reviewItem("s", s.keys, s.keys, sum, s.status, "Shortcut", both || s.status === "both", 0, false)
@@ -277,6 +279,7 @@ function appendShortcuts(out, list, summaryField, both, hiddenMap) {
     // cherry-picked safely. Keep them visible as an explanation without
     // presenting an Include control that the backend would silently ignore.
     row.pickable = s.portable !== false
+    row.removal = !!s.removal
     out.push(row)
   }
 }
@@ -324,6 +327,7 @@ function appendLooseFiles(out, files, both, hiddenMap) {
     var sum = f.semantic_summary || f.summary || ""
     var fileRow = reviewItem("f", p, p, sum, f.status, "File", both || f.status === "both", 0, false, f.changes || [])
     fileRow.removal = !!f.removal
+    fileRow.mergeable = !!f.mergeable
     out.push(fileRow)
   }
 }
@@ -384,7 +388,7 @@ function buildHiddenItems(theme, shortcuts, bundles, files, allFiles, hiddenMap,
   for (var si = 0; si < sList.length; si++) {
     var s = sList[si]
     if (isItemHidden("s", s.keys, hiddenMap, s)) {
-      addHidden("s", s.keys, s.keys, s.label || s.detail || "", s.status, "Shortcut", s.status === "both", 0)
+      addHidden("s", s.keys, s.keys, s.label || s.detail || "", s.status, "Shortcut", s.status === "both", 0, s.removal)
     }
   }
 

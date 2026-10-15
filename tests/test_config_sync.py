@@ -582,6 +582,440 @@ class ShortcutTests(unittest.TestCase):
             self.assertNotIn("SUPER + Q", remaining)
 
 
+SCREENSHOT_PAIR = (
+    'hl.unbind("SUPER + SHIFT + C")\n'
+    'o.bind("SUPER + SHIFT + C", "Screenshot", "omarchy-capture-screenshot")\n'
+)
+
+
+class ShortcutMergeTests(unittest.TestCase):
+    """Three-way shortcut merge: a bind deleted on one side must not bounce back."""
+
+    def _linked(self, env: TempHome, extra: str = "") -> tuple[Path, Path]:
+        repo = make_config_repo(env.home / "cfg")
+        if extra:
+            bindings = repo / "hypr" / "bindings.lua"
+            write(bindings, bindings.read_text(encoding="utf-8") + extra)
+            commit_all(repo, "more bindings")
+        cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+        applied = cs.cmd_apply(env.ctx, argparse_ns())
+        self.assertTrue(applied["ok"], applied)
+        self.assertIn("shortcut_baseline", cs.load_state(env.ctx))
+        return repo, env.ctx.config_hypr / "bindings.lua"
+
+    def _rows(self, env: TempHome) -> dict[str, dict]:
+        snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+        self.assertTrue(snap["ok"], snap)
+        return {r["keys"]: r for r in snap["diff"]["shortcuts"]}
+
+    def _drop(self, path: Path, needle: str) -> None:
+        text = path.read_text(encoding="utf-8")
+        write(path, "".join(line for line in text.splitlines(keepends=True) if needle not in line))
+
+    def test_bind_deleted_here_is_an_outgoing_removal_not_new_in_repo(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._drop(local, '"CTRL + 9"')
+            row = self._rows(env)["CTRL + 9"]
+            self.assertEqual(row["status"], "local")
+            self.assertTrue(row["removal"])
+            self.assertEqual(row["change"], "removed")
+            self.assertFalse(row["default_apply"])
+            # A delete is never ticked for you.
+            self.assertFalse(row["default_publish"])
+
+    def test_publishing_a_removal_deletes_the_unbind_and_bind_from_the_repo(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env, SCREENSHOT_PAIR)
+            self._drop(local, '"SUPER + SHIFT + C"')
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", shortcut=["SUPER + SHIFT + C"]))
+            self.assertTrue(pub["ok"], pub)
+            repo_text = (repo / "hypr" / "bindings.lua").read_text(encoding="utf-8")
+            self.assertNotIn("SUPER + SHIFT + C", repo_text)
+            self.assertIn('"CTRL + 9"', repo_text)
+            self.assertNotIn("SUPER + SHIFT + C", self._rows(env))
+
+    def test_applying_a_repo_removal_deletes_it_here(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env, SCREENSHOT_PAIR)
+            self._drop(repo / "hypr" / "bindings.lua", '"SUPER + SHIFT + C"')
+            commit_all(repo, "Other machine dropped the screenshot bind")
+            row = self._rows(env)["SUPER + SHIFT + C"]
+            self.assertEqual(row["status"], "repo")
+            self.assertTrue(row["removal"])
+            self.assertFalse(row["default_apply"])
+
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", shortcut=["SUPER + SHIFT + C"]))
+            self.assertTrue(ap["ok"], ap)
+            self.assertNotIn("SUPER + SHIFT + C", local.read_text(encoding="utf-8"))
+            backup = Path(ap["backup_dir"]) / "hypr" / "bindings.lua"
+            self.assertIn("SUPER + SHIFT + C", backup.read_text(encoding="utf-8"))
+            self.assertNotIn("SUPER + SHIFT + C", self._rows(env))
+
+    def test_unticked_removal_keeps_its_direction_after_another_apply(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._drop(local, '"CTRL + 9"')
+            bindings = repo / "hypr" / "bindings.lua"
+            write(bindings, bindings.read_text(encoding="utf-8") + 'o.bind("SUPER + D", "Delta", "d")\n')
+            commit_all(repo, "Other machine added SUPER + D")
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", shortcut=["SUPER + D"]))
+            self.assertTrue(ap["ok"], ap)
+            rows = self._rows(env)
+            self.assertNotIn("SUPER + D", rows)
+            self.assertEqual(rows["CTRL + 9"]["status"], "local")
+            self.assertTrue(rows["CTRL + 9"]["removal"])
+            baseline = cs.load_state(env.ctx)["shortcut_baseline"]
+            self.assertEqual(baseline["SUPER + D"], ['o.bind("SUPER + D", "Delta", "d")'])
+            self.assertEqual(baseline["CTRL + 9"], ['o.bind("CTRL + 9", "English layout", "hyprctl switchxkblayout all 0")'])
+
+    def test_state_without_a_shortcut_baseline_recovers_it_from_git_history(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            state = cs.load_state(env.ctx)
+            state.pop("shortcut_baseline")
+            cs.save_state(env.ctx, state)
+            # The repo moves on after this machine's last sync.
+            bindings = repo / "hypr" / "bindings.lua"
+            write(bindings, bindings.read_text(encoding="utf-8") + 'o.bind("SUPER + D", "Delta", "d")\n')
+            commit_all(repo, "Other machine added SUPER + D")
+            self._drop(local, '"CTRL + 9"')
+            rows = self._rows(env)
+            self.assertEqual(rows["CTRL + 9"]["status"], "local")
+            self.assertTrue(rows["CTRL + 9"]["removal"])
+            self.assertEqual(rows["SUPER + D"]["status"], "added-repo")
+
+    def test_without_any_base_a_repo_only_bind_is_still_incoming(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            state = cs.load_state(env.ctx)
+            state.pop("shortcut_baseline")
+            state["file_hashes"]["hypr/bindings.lua"] = "0" * 64
+            cs.save_state(env.ctx, state)
+            self._drop(local, '"CTRL + 9"')
+            self.assertEqual(self._rows(env)["CTRL + 9"]["status"], "added-repo")
+
+    def test_next_baseline_keeps_old_base_where_the_sides_disagree(self) -> None:
+        bind_a = 'o.bind("SUPER + A", "Alpha", "a")'
+        local = bind_a + '\no.bind("SUPER + B", "Beta", "b")\n'
+        repo = bind_a + '\no.bind("SUPER + C", "Gamma", "c")\n'
+        base = cs.next_shortcut_baseline(local, repo, {"SUPER + B": ['o.bind("SUPER + B", "Beta", "b")']})
+        self.assertEqual(base["SUPER + A"], [bind_a])
+        self.assertEqual(base["SUPER + B"], ['o.bind("SUPER + B", "Beta", "b")'])
+        # Absent from the old base, so still known absent: an incoming addition.
+        self.assertNotIn("SUPER + C", base)
+        # With no old base at all, keys the sides disagree on are unknown and
+        # fall back to the two-way rule.
+        fresh = cs.next_shortcut_baseline(local, repo, None)
+        self.assertEqual(fresh["SUPER + A"], [bind_a])
+        self.assertIsNone(fresh["SUPER + B"])
+        self.assertIsNone(fresh["SUPER + C"])
+
+    def test_both_sides_removing_a_bind_drops_it_from_the_baseline(self) -> None:
+        base = cs.next_shortcut_baseline("", "", {"SUPER + A": ['o.bind("SUPER + A", "Alpha", "a")']})
+        self.assertEqual(base, {})
+
+    def test_removal_and_change_on_the_other_side_is_both(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "local.lua"
+            repo = Path(tmp) / "repo.lua"
+            write(local, "")
+            write(repo, 'o.bind("SUPER + A", "Alpha 2", "a2")\n')
+            rows = cs.shortcut_diff(local, repo, baseline={"SUPER + A": ['o.bind("SUPER + A", "Alpha", "a")']})
+            self.assertEqual(rows[0]["status"], "both")
+            self.assertFalse(rows[0]["removal"])
+            self.assertIn("this machine: removed", rows[0]["detail"])
+
+    def test_multi_line_bind_is_not_removed_line_by_line(self) -> None:
+        dest = (
+            'o.bind("SUPER + F", "Fancy", function()\n'
+            '  hl.dispatch(hl.dsp.exec_cmd("fancy"))\n'
+            'end)\n'
+            'o.bind("SUPER + A", "Alpha", "a")\n'
+        )
+        self.assertEqual(cs.upsert_shortcut_lines(dest, {}, ["SUPER + F"]), dest)
+        kept, skipped = cs.filter_portable_shortcuts("", ["SUPER + F", "SUPER + A"], dest)
+        self.assertEqual(kept, ["SUPER + A"])
+        self.assertEqual(skipped[0]["keys"], "SUPER + F")
+        self.assertIn("several lines", skipped[0]["reason"])
+        self.assertEqual(
+            cs.upsert_shortcut_lines(dest, {}, ["SUPER + A"]),
+            dest.replace('o.bind("SUPER + A", "Alpha", "a")\n', ""),
+        )
+
+
+LOOK = "".join(f"setting_{n} = {n}\n" for n in range(1, 13))
+
+
+class FileMergeTests(unittest.TestCase):
+    """A file both machines edited merges instead of forcing one side to lose."""
+
+    def _linked(self, env: TempHome) -> tuple[Path, Path]:
+        repo = make_config_repo(env.home / "cfg")
+        write(repo / "hypr" / "looknfeel.lua", LOOK)
+        commit_all(repo, "longer looknfeel")
+        cs.cmd_connect(env.ctx, argparse_ns(args=[str(repo)]))
+        applied = cs.cmd_apply(env.ctx, argparse_ns())
+        self.assertTrue(applied["ok"], applied)
+        return repo, env.ctx.config_hypr / "looknfeel.lua"
+
+    def _edit(self, path: Path, old: str, new: str) -> None:
+        text = path.read_text(encoding="utf-8")
+        self.assertIn(old, text)
+        write(path, text.replace(old, new))
+
+    def _file(self, env: TempHome, rel: str) -> dict:
+        snap = cs.cmd_snapshot(env.ctx, argparse_ns())
+        self.assertTrue(snap["ok"], snap)
+        return next(f for f in snap["diff"]["files"] if f["path"] == rel)
+
+    def test_edits_to_different_lines_merge_then_publish(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._edit(local, "setting_2 = 2", "setting_2 = 20")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_11 = 11", "setting_11 = 110")
+            commit_all(repo, "Other machine edits")
+
+            row = self._file(env, "hypr/looknfeel.lua")
+            self.assertEqual(row["status"], "both")
+            self.assertTrue(row["mergeable"])
+            self.assertEqual(row["merge_overlaps"], [])
+            self.assertEqual(row["default_side"], "merge")
+            self.assertTrue(row["default_apply"])
+            self.assertIn("Merge keeps both sides' edits", row["semantic_summary"])
+
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", merge=["hypr/looknfeel.lua"]))
+            self.assertTrue(ap["ok"], ap)
+            self.assertIn("hypr/looknfeel.lua", ap["applied"])
+            text = local.read_text(encoding="utf-8")
+            self.assertIn("setting_2 = 20", text)
+            self.assertIn("setting_11 = 110", text)
+            self.assertTrue((Path(ap["backup_dir"]) / "hypr" / "looknfeel.lua").is_file())
+
+            # The repo still lacks this machine's edit: now a plain outgoing row.
+            row = self._file(env, "hypr/looknfeel.lua")
+            self.assertEqual(row["status"], "local")
+            self.assertTrue(row["default_publish"])
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="hypr/looknfeel.lua"))
+            self.assertTrue(pub["ok"], pub)
+            self.assertEqual((repo / "hypr" / "looknfeel.lua").read_text(encoding="utf-8"), text)
+            self.assertEqual(self._file(env, "hypr/looknfeel.lua")["status"], "identical")
+
+    def test_publishing_a_merge_first_comes_back_as_incoming(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._edit(local, "setting_2 = 2", "setting_2 = 20")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_11 = 11", "setting_11 = 110")
+            commit_all(repo, "Other machine edits")
+
+            pub = cs.cmd_publish(env.ctx, argparse_ns(explicit=True, files="", merge=["hypr/looknfeel.lua"]))
+            self.assertTrue(pub["ok"], pub)
+            repo_text = (repo / "hypr" / "looknfeel.lua").read_text(encoding="utf-8")
+            self.assertIn("setting_2 = 20", repo_text)
+            self.assertIn("setting_11 = 110", repo_text)
+            self.assertNotIn("setting_11 = 110", local.read_text(encoding="utf-8"))
+
+            row = self._file(env, "hypr/looknfeel.lua")
+            self.assertEqual(row["status"], "repo")
+            self.assertTrue(row["default_apply"])
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="hypr/looknfeel.lua"))
+            self.assertTrue(ap["ok"], ap)
+            self.assertEqual(self._file(env, "hypr/looknfeel.lua")["status"], "identical")
+
+    def test_file_that_already_has_the_repo_edit_is_just_outgoing(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            # Both machines made the same edit; only this one made a second.
+            self._edit(local, "setting_5 = 5", "setting_5 = 50")
+            self._edit(local, "setting_9 = 9", "setting_9 = 90")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_5 = 5", "setting_5 = 50")
+            commit_all(repo, "Same edit elsewhere")
+            row = self._file(env, "hypr/looknfeel.lua")
+            self.assertEqual(row["status"], "local")
+            self.assertFalse(row["mergeable"])
+            self.assertTrue(row["default_publish"])
+            self.assertIn("Already has the repo's edits", row["semantic_summary"])
+
+    def test_overlapping_edit_keeps_this_machine_and_is_not_ticked(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._edit(local, "setting_2 = 2", "setting_2 = 20")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_2 = 2", "setting_2 = 200")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_11 = 11", "setting_11 = 110")
+            commit_all(repo, "Overlapping edit")
+            row = self._file(env, "hypr/looknfeel.lua")
+            self.assertEqual(row["status"], "both")
+            self.assertTrue(row["mergeable"])
+            self.assertEqual(row["merge_overlaps"], ["1 overlapping edit"])
+            self.assertEqual(row["default_side"], "")
+            self.assertFalse(row["default_apply"])
+
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", merge=["hypr/looknfeel.lua"]))
+            self.assertTrue(ap["ok"], ap)
+            text = local.read_text(encoding="utf-8")
+            self.assertIn("setting_2 = 20\n", text)
+            self.assertIn("setting_11 = 110", text)
+            self.assertNotIn("<<<<<<<", text)
+
+    def test_shell_json_merges_key_by_key_and_keeps_the_tray_widget(self) -> None:
+        with TempHome() as env:
+            repo, _ = self._linked(env)
+            shell = env.ctx.config_omarchy / "shell.json"
+            data = json.loads(shell.read_text(encoding="utf-8"))
+            data["idle"]["lock"] = 1200
+            data["bar"]["layout"]["right"].append({"id": cs.PLUGIN_ID})
+            write(shell, json.dumps(data, indent=2) + "\n")
+            repo_shell = repo / "omarchy" / "shell.json"
+            other = json.loads(repo_shell.read_text(encoding="utf-8"))
+            other["bar"]["position"] = "top"
+            write(repo_shell, json.dumps(other, indent=2) + "\n")
+            commit_all(repo, "Bar on top elsewhere")
+
+            row = self._file(env, "omarchy/shell.json")
+            self.assertEqual(row["status"], "both")
+            self.assertTrue(row["mergeable"])
+            self.assertEqual(row["merge_overlaps"], [])
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", merge=["omarchy/shell.json"]))
+            self.assertTrue(ap["ok"], ap)
+            merged = json.loads(shell.read_text(encoding="utf-8"))
+            self.assertEqual(merged["idle"]["lock"], 1200)
+            self.assertEqual(merged["bar"]["position"], "top")
+            self.assertIn({"id": cs.PLUGIN_ID}, merged["bar"]["layout"]["right"])
+            self.assertEqual(self._file(env, "omarchy/shell.json")["status"], "local")
+
+    def test_without_a_recoverable_base_both_stays_a_choice(self) -> None:
+        with TempHome() as env:
+            repo, local = self._linked(env)
+            self._edit(local, "setting_2 = 2", "setting_2 = 20")
+            self._edit(repo / "hypr" / "looknfeel.lua", "setting_11 = 11", "setting_11 = 110")
+            commit_all(repo, "Other machine edits")
+            state = cs.load_state(env.ctx)
+            state["file_hashes"]["hypr/looknfeel.lua"] = "0" * 64
+            cs.save_state(env.ctx, state)
+            row = self._file(env, "hypr/looknfeel.lua")
+            self.assertEqual(row["status"], "both")
+            self.assertFalse(row["mergeable"])
+            # A stale --merge for it is ignored rather than guessed at.
+            ap = cs.cmd_apply(env.ctx, argparse_ns(explicit=True, files="", merge=["hypr/looknfeel.lua"]))
+            self.assertEqual(ap["message"], "Nothing to apply.")
+            self.assertNotIn("setting_11 = 110", local.read_text(encoding="utf-8"))
+
+    def test_theme_selection_is_never_merged(self) -> None:
+        self.assertFalse(cs.is_mergeable_path({
+            "path": cs.THEME_REL, "group": "theme", "portable": True, "local_exists": True, "repo_exists": True,
+        }))
+        self.assertFalse(cs.is_mergeable_path({
+            "path": "plugins/demo.widget/Main.qml", "portable": True, "local_exists": True, "repo_exists": True,
+        }))
+
+    def test_merge_json_values(self) -> None:
+        overlaps: list[str] = []
+        merged = cs.merge_json_values(
+            {"a": 1, "b": {"x": 1, "y": 1}, "gone": 1, "kept": 1},
+            {"a": 2, "b": {"x": 2, "y": 1}, "kept": 1, "mine": 1},
+            {"a": 3, "b": {"x": 1, "y": 3}, "gone": 1, "theirs": 1},
+            "",
+            overlaps,
+        )
+        # Local wins the overlap on "a"; "b" merges inside; local's delete of
+        # "gone" and the repo's delete of "kept" both land.
+        self.assertEqual(merged, {"a": 2, "b": {"x": 2, "y": 3}, "mine": 1, "theirs": 1})
+        self.assertEqual(overlaps, ["a"])
+
+
+class KeycodeDuplicateTests(unittest.TestCase):
+    """`code:N` copies of a keysym bind fire together with it on one press."""
+
+    DEFAULTS = (
+        'o.bind("SUPER + C", "Universal copy", "copy")\n'
+        'o.bind("SUPER + CTRL + V", "Clipboard manager", "clip")\n'
+        'o.bind("SUPER + code:10", "Workspace 1", "ws1")\n'
+    )
+
+    def _diff(self, local_text: str, repo_text: str, **kwargs) -> dict[str, dict]:
+        with tempfile.TemporaryDirectory() as tmp:
+            local = Path(tmp) / "local.lua"
+            repo = Path(tmp) / "repo.lua"
+            write(local, local_text)
+            write(repo, repo_text)
+            return {r["keys"]: r for r in cs.shortcut_diff(local, repo, **kwargs)}
+
+    def test_keycode_alias(self) -> None:
+        self.assertEqual(cs.keycode_alias("SUPER + code:54"), "SUPER + C")
+        self.assertEqual(cs.keycode_alias("SUPER + SHIFT + code:24"), "SUPER + SHIFT + Q")
+        self.assertEqual(cs.keycode_alias("code:10"), "1")
+        self.assertIsNone(cs.keycode_alias("SUPER + C"))
+        self.assertIsNone(cs.keycode_alias("SUPER + code:200"))
+
+    def test_incoming_copy_of_an_omarchy_default_is_flagged_and_unticked(self) -> None:
+        rows = self._diff(
+            "",
+            'o.bind("SUPER + code:54", "Universal copy", "copy2")\n'
+            'o.bind("SUPER + CTRL + code:55", "Clipboard manager", "clip")\n',
+            defaults_text=self.DEFAULTS,
+        )
+        copy = rows["SUPER + code:54"]
+        self.assertEqual(copy["duplicate_of"], "SUPER + C")
+        self.assertFalse(copy["default_apply"])
+        self.assertIn("one press runs both", copy["detail"])
+        # code:55 is V; SUPER + CTRL + V is a default too.
+        self.assertEqual(rows["SUPER + CTRL + code:55"]["duplicate_of"], "SUPER + CTRL + V")
+
+    def test_copy_of_a_bind_in_the_same_batch_is_flagged(self) -> None:
+        rows = self._diff(
+            "",
+            'o.bind("SUPER + SHIFT + Q", "Super Desktop", "toggle")\n'
+            'o.bind("SUPER + SHIFT + code:24", "Super Desktop", "toggle")\n',
+        )
+        self.assertTrue(rows["SUPER + SHIFT + Q"]["default_apply"])
+        self.assertEqual(rows["SUPER + SHIFT + code:24"]["duplicate_of"], "SUPER + SHIFT + Q")
+        self.assertFalse(rows["SUPER + SHIFT + code:24"]["default_apply"])
+
+    def test_keycode_bind_for_an_unbound_key_is_not_a_duplicate(self) -> None:
+        rows = self._diff(
+            'hl.unbind("SUPER + C")\n',
+            'hl.unbind("SUPER + C")\no.bind("SUPER + code:54", "Copy", "copy")\n',
+            defaults_text=self.DEFAULTS,
+        )
+        self.assertEqual(rows["SUPER + code:54"]["duplicate_of"], "")
+        self.assertTrue(rows["SUPER + code:54"]["default_apply"])
+
+    def test_omarchy_keycode_defaults_are_not_flagged(self) -> None:
+        rows = self._diff("", 'o.bind("SUPER + code:11", "Workspace 2", "ws2")\n', defaults_text=self.DEFAULTS)
+        self.assertEqual(rows["SUPER + code:11"]["duplicate_of"], "")
+
+    def test_unbind_that_moved_to_a_keycode_does_not_strand_the_key(self) -> None:
+        local = SCREENSHOT_PAIR
+        repo = 'hl.unbind("SUPER + SHIFT + C")\no.bind("SUPER + SHIFT + code:54", "Screenshot", "omarchy-capture-screenshot")\n'
+        baseline = cs.shortcut_baseline_from_text(local)
+        rows = self._diff(local, repo, baseline=baseline)
+        moved = rows["SUPER + SHIFT + C"]
+        self.assertEqual(moved["status"], "repo")
+        self.assertEqual(moved["moved_to"], "SUPER + SHIFT + code:54")
+        self.assertFalse(moved["default_apply"])
+        self.assertIn("unbinds Screenshot", moved["detail"])
+        # Taking the keycode copy as well would double-fire with the keysym bind here.
+        self.assertEqual(rows["SUPER + SHIFT + code:54"]["duplicate_of"], "SUPER + SHIFT + C")
+
+    def test_unbind_is_fine_when_this_side_has_the_keycode_too(self) -> None:
+        keycode = 'o.bind("SUPER + SHIFT + code:54", "Screenshot", "shot")\n'
+        local = SCREENSHOT_PAIR + keycode
+        repo = 'hl.unbind("SUPER + SHIFT + C")\n' + keycode
+        rows = self._diff(local, repo, baseline=cs.shortcut_baseline_from_text(local))
+        self.assertEqual(rows["SUPER + SHIFT + C"]["moved_to"], "")
+        self.assertTrue(rows["SUPER + SHIFT + C"]["default_apply"])
+        self.assertEqual(rows["SUPER + SHIFT + C"]["detail"], "unbinds Screenshot")
+
+    def test_default_bindings_are_read_from_the_omarchy_tree(self) -> None:
+        with TempHome() as env:
+            root = env.home / "omarchy"
+            write(root / "default" / "hypr" / "bindings" / "clipboard.lua", self.DEFAULTS)
+            env.ctx.omarchy_root = root
+            self.assertIn("Universal copy", cs.omarchy_default_bindings_text(env.ctx))
+            env.ctx.omarchy_root = None
+            self.assertEqual(cs.omarchy_default_bindings_text(env.ctx), "")
+
+
 class HelperScriptDiscoveryTests(unittest.TestCase):
     def test_referenced_local_helper_is_offered_unrelated_bin_is_not(self) -> None:
         with TempHome() as env:
@@ -1277,6 +1711,52 @@ console.log(JSON.stringify({{
 
         self.assertFalse(data["row"]["pickable"])
         self.assertIn("references a local", data["row"]["summary"])
+
+    def test_shortcut_removal_and_duplicate_rows(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node not available")
+
+        model_path = ROOT / "Model.js"
+        script = f"""
+const fs = require('fs');
+const vm = require('vm');
+const code = fs.readFileSync({json.dumps(str(model_path))}, 'utf8').replace(/^\\.pragma\\s+library\\s*/m, '');
+const ctx = {{}};
+vm.createContext(ctx);
+vm.runInContext(code, ctx);
+
+const removed = {{
+  keys: 'SUPER + code:54', label: 'Universal copy', detail: 'Universal copy',
+  status: 'local', removal: true, portable: true
+}};
+const duplicate = {{
+  keys: 'SUPER + SHIFT + code:24', label: 'Super Desktop',
+  detail: 'Super Desktop · same key as SUPER + SHIFT + Q, so one press runs both',
+  status: 'added-repo', duplicate_of: 'SUPER + SHIFT + Q', portable: true
+}};
+const out = ctx.buildOutgoingItems([], [], [removed], [], [], [], {{}});
+const inc = ctx.buildIncomingItems([], [duplicate], [], [], [], [], {{}});
+const both = ctx.buildBothItems([], [], [], [
+  {{ path: 'omarchy/shell.json', status: 'both', mergeable: true, semantic_summary: 'Merge keeps both sides' }},
+  {{ path: 'omarchy/theme.name', status: 'both' }}
+], [], {{}});
+console.log(JSON.stringify({{
+  removed: out[0],
+  label: ctx.fileStatusLabel(out[0].status, out[0].removal),
+  duplicate: inc[0],
+  both: both
+}}));
+"""
+        proc = subprocess.run([node, "-e", script], capture_output=True, text=True, check=True)
+        data = json.loads(proc.stdout.strip())
+
+        self.assertTrue(data["both"][0]["mergeable"])
+        self.assertFalse(data["both"][1]["mergeable"])
+        self.assertTrue(data["removed"]["removal"])
+        self.assertTrue(data["removed"]["pickable"])
+        self.assertEqual(data["label"], "Removed here")
+        self.assertIn("one press runs both", data["duplicate"]["summary"])
 
     def test_incoming_and_outgoing_plugin_isolation(self) -> None:
         node = shutil.which("node")
